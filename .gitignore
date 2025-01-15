@@ -1,0 +1,7 @@
+.cache/
+checkpoints/
+ClimSim/
+runs/
+train/
+ClimSim_low-res_grid-info.nc
+__*
