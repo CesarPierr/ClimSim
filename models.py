@@ -11,11 +11,6 @@ import torch.nn.functional as F
 class PNet(nn.Module):
 
     def __init__(self, in_channels=6, out_channels=10, hidden_channels=[16, 32, 64]):
-        """
-        in_channels  = nombre de canaux en entrée (ex: 6)
-        out_channels = nombre de canaux latents voulus en sortie (ex: 10)
-        hidden_channels : liste d'entiers pour les convolutions 1D
-        """
         super(PNet, self).__init__()
         
         self.conv_layers = nn.Sequential(
@@ -194,7 +189,6 @@ class ConditionalWGANGPDiscriminator(nn.Module):
         x.shape = (B, Pos, Alt, C_x)
         y.shape = (B, Pos, Alt, C_y)
 
-        On concatène x et y sur l'axe canaux => shape (B, Pos, Alt, C_x + C_y).
         """
         B, P, Alt, Cx = x.shape
         _, _, _, Cy = y.shape
