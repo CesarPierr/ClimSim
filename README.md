@@ -2,20 +2,14 @@
 
 ## Introduction
 
-This project implements a **Conditional Wasserstein Generative Adversarial Network with Gradient Penalty (WGAN-GP)** integrated with **Normalizing Flows**. The model is designed to generate high-dimensional data conditioned on input variables, making it suitable for applications like climate simulations, traffic modeling, and other domains requiring complex data generation.
-
+This project implements a **Conditional Generative Adversarial Network** integrated with **Normalizing Flows**. 
 ## Features
 
 - **Conditional WGAN-GP**: Enhances the standard WGAN-GP by incorporating conditional information, allowing the generator to produce outputs based on specific input conditions.
 - **Normalizing Flows**: Utilizes normalizing flows to model complex data distributions with exact likelihood computation.
 - **TensorBoard Integration**: Logs training metrics and visualizations for real-time monitoring.
 - **Checkpointing**: Saves model states after each epoch, enabling training resumption from saved checkpoints.
-- **Gradient Clipping**: Stabilizes training by preventing gradient explosion.
-
-## Project Structure
-
-conditional-wgangp-flows/ │ ├── train_conditional_wgangp.py # Main training script ├── models.py # Model definitions (Generator, Discriminator, Flows) ├── dataset.py # Dataset handling and preprocessing ├── requirements.txt # Python dependencies ├── checkpoints/ # Directory for saving model checkpoints ├── runs/ # TensorBoard logs ├── README.md # Project documentation └── ... # Additional scripts and resources
-
+`
 
 ## Model Architecture
 
