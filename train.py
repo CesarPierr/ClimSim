@@ -62,7 +62,7 @@ def train_wgangp_conditional(
     device,
     num_epochs=10,
     lr=1e-4,
-    lr_discr=1e-4,
+    lr_discr=1e-5,
     lambda_gp=10.0,
     alpha_nll=1.0,
     gamma_clip=1.0,
@@ -272,7 +272,7 @@ def main():
     gen = ConditionalFlowGenerator2d(
         context_channels=6, 
         latent_channels=10, 
-        num_flows=12 
+        num_flows=8 
     ).to(device)
     
     disc = ConditionalWGANGPDiscriminator2d(
