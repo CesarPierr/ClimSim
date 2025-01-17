@@ -167,7 +167,7 @@ class ConditionalFlowGenerator(nn.Module):
 
 class ConditionalWGANGPDiscriminator(nn.Module):
 
-    def __init__(self, in_channels_x=6, in_channels_y=10, hidden_channels=[64, 64, 64]):
+    def __init__(self, in_channels_x=6, in_channels_y=10, hidden_channels=[16, 32, 64]):
         super().__init__()
         self.in_channels_x = in_channels_x
         self.in_channels_y = in_channels_y
@@ -240,28 +240,30 @@ class PNet2d(nn.Module):
     On suppose l'entrée x a shape (B, Pos, Alt, C_in),
     et on veut en sortie mu, sigma de shape (B, Pos, Alt, out_channels).
     """
-    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[64, 64, 64]):
+    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[16, 32, 64]):
         super().__init__()
         # Les conv2d prendront in_channels=6 (C_in),
         # et on considère (Alt, Pos) comme (H, W).
         layers = []
         inC = in_channels
         # 1er bloc
-        layers.append(nn.Conv2d(inC, hidden_channels[0], kernel_size=(7,9), padding=(2,4)))
-        layers.append(nn.LeakyReLU())
+        layers.append(nn.Conv2d(inC, hidden_channels[0], kernel_size=(7,9), padding=(3,4)))
         layers.append(nn.BatchNorm2d(hidden_channels[0]))
+        layers.append(nn.LeakyReLU())
         inC = hidden_channels[0]
 
         # 2e bloc
-        layers.append(nn.Conv2d(inC, hidden_channels[1], kernel_size=(5,7), padding=(1,3)))
-        layers.append(nn.LeakyReLU())
+        layers.append(nn.Conv2d(inC, hidden_channels[1], kernel_size=(5,7), padding=(2,3)))
         layers.append(nn.BatchNorm2d(hidden_channels[1]))
+        layers.append(nn.LeakyReLU())
+        
         inC = hidden_channels[1]
 
         # 3e bloc
-        layers.append(nn.Conv2d(inC, hidden_channels[2], kernel_size=(3,5), padding=(1,3)))
-        layers.append(nn.LeakyReLU())
+        layers.append(nn.Conv2d(inC, hidden_channels[2], kernel_size=(3,5), padding=(1,2)))
         layers.append(nn.BatchNorm2d(hidden_channels[2]))
+        layers.append(nn.LeakyReLU())
+        
         inC = hidden_channels[2]
 
         # Dernier bloc : output = out_channels * 2
@@ -302,18 +304,21 @@ class KNet2d(nn.Module):
     """
     Produit k(x) en 2D. shape finale (B, Pos, Alt, out_channels).
     """
-    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[64, 64]):
+    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[20, 20]):
         super().__init__()
         layers = []
         inC = in_channels
         # Bloc 1
         layers.append(nn.Conv2d(inC, hidden_channels[0], kernel_size=(7,7), padding=(3,3)))
+        layers.append(nn.BatchNorm2d(hidden_channels[0]))
         layers.append(nn.LeakyReLU())
         # Bloc 2
         layers.append(nn.Conv2d(hidden_channels[0], hidden_channels[1], kernel_size=(5,5), padding=(2,2)))
+        layers.append(nn.BatchNorm2d(hidden_channels[1]))
         layers.append(nn.LeakyReLU())
         # Bloc final
         layers.append(nn.Conv2d(hidden_channels[1], out_channels, kernel_size=3, padding=1))
+        layers.append(nn.BatchNorm2d(out_channels))
 
         self.conv2d = nn.Sequential(*layers)
 
@@ -336,18 +341,23 @@ class BNet2d(nn.Module):
     """
     Produit b(x) en 2D. shape finale (B, Pos, Alt, out_channels).
     """
-    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[64, 64]):
+    def __init__(self, in_channels=6, out_channels=10, hidden_channels=[20, 20]):
         super().__init__()
         layers = []
         inC = in_channels
         # Bloc 1
+
         layers.append(nn.Conv2d(inC, hidden_channels[0], kernel_size=7, padding=3))
+        layers.append(nn.BatchNorm2d(hidden_channels[0]))
         layers.append(nn.LeakyReLU())
         # Bloc 2
+
         layers.append(nn.Conv2d(hidden_channels[0], hidden_channels[1], kernel_size=5, padding=2))
+        layers.append(nn.BatchNorm2d(hidden_channels[1]))
         layers.append(nn.LeakyReLU())
         # Bloc final
         layers.append(nn.Conv2d(hidden_channels[1], out_channels, kernel_size=3, padding=1))
+        layers.append(nn.BatchNorm2d(out_channels))
 
         self.conv2d = nn.Sequential(*layers)
 
@@ -437,15 +447,17 @@ class ConditionalFlowGenerator2d(nn.Module):
         return lp_gauss + total_log_det
 
 class ConditionalWGANGPDiscriminator2d(nn.Module):
-    def __init__(self, in_channels_x=6, in_channels_y=10, hidden_channels_params=[(64,7,3),(64,5,2),(64,3,1)]):
+    def __init__(self, in_channels_x=6, in_channels_y=10, hidden_channels_params=[(64,7,3),(32,5,2),(16,3,1)]):
         super().__init__()
         total_in = in_channels_x + in_channels_y
         layers = []
         inC = total_in
         # on va faire 2D => conv2d(inC, hidden_channels[0], 3, padding=1), ...
         for hc,ker,pad in hidden_channels_params:
+            layers.append(nn.BatchNorm2d(inC))
             layers.append(nn.Conv2d(inC, hc, kernel_size=ker, padding=pad))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
+            layers.append(nn.Dropout2d(0.25))
             inC = hc
         self.conv = nn.Sequential(*layers)
         self.fc = nn.Linear(hidden_channels_params[-1][0], 1)

@@ -26,7 +26,7 @@ def parse_arguments():
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size.")
     parser.add_argument("--lambda_gp", type=float, default=10.0, help="Gradient penalty coefficient.")
-    parser.add_argument("--alpha_nll", type=float, default=0.1, help="Coefficient for the NLL part of loss.")
+    parser.add_argument("--alpha_nll", type=float, default=0.5, help="Coefficient for the NLL part of loss.")
     parser.add_argument("--gamma_clip", type=float, default=1.0, help="Gradient clipping value.")
     parser.add_argument("--visual_interval", type=int, default=1, help="Epoch interval to log images in TensorBoard.")
     parser.add_argument("--log_dir", type=str, default="runs", help="Directory for TensorBoard logs.")
@@ -244,7 +244,7 @@ def main():
     disc = ConditionalWGANGPDiscriminator2d(
         in_channels_x=6, 
         in_channels_y=10, 
-        hidden_channels=[64,64,64]
+        #hidden_channels=[64,64,64]
     ).to(device)
 
     # Reprise d'entraînement si spécifié
