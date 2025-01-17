@@ -13,17 +13,19 @@ logging.basicConfig(level=logging.INFO)
 
 class ClimSimDataset(Dataset):
     def __init__(self, 
-                 base_dir: str,
-                 grid_file: str,
-                 normalize: bool = True,
-                 data_split: str = 'train',
-                 regexps: list = None,
-                 cnn_reshape: bool = False,
-                 stride_sample: int = 1,):
+                    base_dir: str,
+                    dataset_dir: str,
+                    grid_file: str,
+                    normalize: bool = True,
+                    data_split: str = 'train',
+                    regexps: list = None,
+                    cnn_reshape: bool = False,
+                    stride_sample: int = 1,):
 
         super().__init__()
         self.base_dir = Path(base_dir).resolve()
-        norm_path = self.base_dir / 'ClimSim' / 'preprocessing' / 'normalizations'
+        dataset_dir = Path(dataset_dir).resolve()
+        norm_path = dataset_dir / 'ClimSim' / 'preprocessing' / 'normalizations'
         self.normalize = normalize
         self.cnn_reshape = cnn_reshape
 

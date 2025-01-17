@@ -1,24 +1,31 @@
 import argparse
 import os
+import io
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as utils
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
 import matplotlib
 matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
+import wandb
+from PIL import Image  # Import nécessaire pour manipuler les images PIL
 from dataset import ClimSimDataset
-from models import ConditionalFlowGenerator, ConditionalWGANGPDiscriminator, ConditionalFlowGenerator2d, ConditionalWGANGPDiscriminator2d
-from models import gradient_penalty_conditional  
+from models import (
+    ConditionalFlowGenerator2d,
+    ConditionalWGANGPDiscriminator2d,
+    gradient_penalty_conditional,
+)
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Training WGAN-GP (conditional) with Flow + optional Reconstruction Loss + TensorBoard + Checkpoints.")
+    parser = argparse.ArgumentParser(
+        description="Training WGAN-GP (conditional) with Flow + optional Reconstruction Loss + wandb + Checkpoints."
+    )
     parser.add_argument("--resume_gen", type=str, default="", help="Path to a generator checkpoint to resume from.")
     parser.add_argument("--resume_disc", type=str, default="", help="Path to a discriminator checkpoint to resume from.")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save model checkpoints.")
@@ -28,15 +35,25 @@ def parse_arguments():
     parser.add_argument("--lambda_gp", type=float, default=10.0, help="Gradient penalty coefficient.")
     parser.add_argument("--alpha_nll", type=float, default=0.5, help="Coefficient for the NLL part of loss.")
     parser.add_argument("--gamma_clip", type=float, default=1.0, help="Gradient clipping value.")
-    parser.add_argument("--visual_interval", type=int, default=1, help="Epoch interval to log images in TensorBoard.")
-    parser.add_argument("--log_dir", type=str, default="runs", help="Directory for TensorBoard logs.")
-
-    # Nouveaux arguments pour la reconstruction
+    parser.add_argument("--visual_interval", type=int, default=1, help="Epoch interval to log images with wandb.")
     parser.add_argument("--use_recon", action="store_true", help="Use MSE reconstruction loss or not.")
     parser.add_argument("--alpha_recon", type=float, default=1.0, help="Weight of the reconstruction loss if use_recon is True.")
 
+    # Ajout de l'argument "project" pour configurer wandb
+    parser.add_argument("--wandb_project", type=str, default="ClimSim", help="Wandb project name.")
+
     return parser.parse_args()
 
+def fig_to_wandb_image(fig):
+    """
+    Convertit une figure Matplotlib en image utilisable par wandb.
+    Retourne un objet `wandb.Image`.
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    buf.seek(0)
+    image = Image.open(buf).convert("RGB")  # Conversion en image RGB pour éviter les problèmes de mode
+    return wandb.Image(image)  # Passe l'image PIL à wandb.Image
 
 def train_wgangp_conditional(
     gen,
@@ -45,34 +62,36 @@ def train_wgangp_conditional(
     device,
     num_epochs=10,
     lr=1e-4,
+    lr_discr=1e-4,
     lambda_gp=10.0,
     alpha_nll=1.0,
     gamma_clip=1.0,
     visual_interval=1,
-    writer=None,
     save_dir="checkpoints",
     use_recon=False,
-    alpha_recon=1.0
+    alpha_recon=1.0,
+    initial_step=0  # Ajout d'un paramètre pour initialiser global_step
 ):
     """
     Entraînement du WGAN-GP conditionnel avec Flow + (optionnel) Reconstruction MSE.
-    On log aussi des métriques (moyenne, variance) pour détecter un éventuel mode collapse.
+    On log aussi des métriques (moyenne, variance) pour détecter un éventuel mode collapse, 
+    mais tout se fait via wandb.
     """
     os.makedirs(save_dir, exist_ok=True)
 
     opt_gen = torch.optim.Adam(gen.parameters(), lr=lr, betas=(0.5, 0.9))
-    opt_disc = torch.optim.Adam(disc.parameters(), lr=lr, betas=(0.5, 0.9))
+    opt_disc = torch.optim.Adam(disc.parameters(), lr=lr_discr, betas=(0.5, 0.9))
 
     gen.train()
     disc.train()
 
-    global_step = 0  # Compteur d'itérations (pour TensorBoard)
+    global_step = initial_step  # Initialisation de global_step
     for epoch in range(num_epochs):
-        epoch_disc_loss = 0.
-        epoch_gen_adv = 0.
-        epoch_gen_nll = 0.
-        epoch_gen_recon = 0.  # somme de la loss recon
-        epoch_gp = 0.
+        epoch_disc_loss = 0.0
+        epoch_gen_adv   = 0.0
+        epoch_gen_nll   = 0.0
+        epoch_gen_recon = 0.0
+        epoch_gp        = 0.0
 
         for batch_data in tqdm(loader, desc=f"[Epoch {epoch+1}/{num_epochs}]", total=len(loader)):
             x = batch_data["input"].to(device)   # (B, Pos, Alt, Cx)
@@ -112,10 +131,9 @@ def train_wgangp_conditional(
 
             loss_g_total = loss_g_adv + alpha_nll * loss_nll
 
-            # (optionnel) Ajout de la reconstruction
             if use_recon:
                 loss_recon = F.mse_loss(fake2, y)
-                loss_g_total = loss_g_total + alpha_recon * loss_recon
+                loss_g_total += alpha_recon * loss_recon
                 epoch_gen_recon += loss_recon.item()
 
             opt_gen.zero_grad()
@@ -127,56 +145,63 @@ def train_wgangp_conditional(
             epoch_gen_nll += loss_nll.item()
 
             # ----------------------
-            #   3) Metrics / Logs
+            #   3) Logging wandb
             # ----------------------
-            if writer is not None:
-                # Losses
-                writer.add_scalar("Train/Discriminator", loss_d.item(), global_step)
-                writer.add_scalar("Train/GP", gp.item(), global_step)
-                writer.add_scalar("Train/Generator_adv", loss_g_adv.item(), global_step)
-                writer.add_scalar("Train/Generator_NLL", loss_nll.item(), global_step)
-                if use_recon:
-                    writer.add_scalar("Train/Generator_Recon", loss_recon.item(), global_step)
+            # On loggue les scalaires avec global_step
+            logs = {
+                "Train/Discriminator": loss_d.item(),
+                "Train/GP": gp.item(),
+                "Train/Generator_adv": loss_g_adv.item(),
+                "Train/Generator_NLL": loss_nll.item(),
+            }
+            if use_recon:
+                logs["Train/Generator_Recon"] = loss_recon.item()
 
-                # (optionnel) Suivi de la moyenne/variance Real vs Fake pour détecter un collapse
-                with torch.no_grad():
-                    # dimension (B, P, Alt, Cy)
-                    real_mean = y.mean(dim=(1,2,3))       # (B,)
-                    real_var  = y.var(dim=(1,2,3))        # (B,)
-                    fake_mean = fake2.mean(dim=(1,2,3))   # (B,)
-                    fake_var  = fake2.var(dim=(1,2,3))    # (B,)
+            # (optionnel) Suivi de la moyenne/variance Real vs Fake
+            with torch.no_grad():
+                real_mean = y.mean(dim=(1,2,3))     # (B,)
+                real_var  = y.var(dim=(1,2,3))      # (B,)
+                fake_mean = fake2.mean(dim=(1,2,3)) # (B,)
+                fake_var  = fake2.var(dim=(1,2,3))  # (B,)
 
-                    # On peut calculer la L1 ou L2 distance
-                    mean_diff = (real_mean - fake_mean).abs().mean()
-                    var_diff  = (real_var - fake_var).abs().mean()
+                mean_diff = (real_mean - fake_mean).abs().mean()
+                var_diff  = (real_var - fake_var).abs().mean()
 
-                writer.add_scalar("Dist/Mean_diff", mean_diff.item(), global_step)
-                writer.add_scalar("Dist/Var_diff", var_diff.item(), global_step)
+            logs["Dist/Mean_diff"] = mean_diff.item()
+            logs["Dist/Var_diff"]  = var_diff.item()
+
+            wandb.log(logs, step=global_step)
 
             global_step += 1
 
-        # Moyennes par époque
+        # Moyennes sur l'époque
         nb_batches = len(loader)
         avg_disc_loss = epoch_disc_loss / nb_batches
         avg_gp        = epoch_gp / nb_batches
         avg_gen_adv   = epoch_gen_adv / nb_batches
         avg_gen_nll   = epoch_gen_nll / nb_batches
-        avg_gen_recon = (epoch_gen_recon / nb_batches) if use_recon else 0.
+        avg_gen_recon = (epoch_gen_recon / nb_batches) if use_recon else 0.0
 
-        print(f"Epoch[{epoch+1}/{num_epochs}] "
-              f"D_loss={avg_disc_loss:.4f}, "
-              f"GP={avg_gp:.4f}, "
-              f"G_adv={avg_gen_adv:.4f}, "
-              f"G_nll={avg_gen_nll:.4f}, "
-              f"G_recon={avg_gen_recon:.4f} (if used)")
+        print(
+            f"Epoch[{epoch+1}/{num_epochs}] "
+            f"D_loss={avg_disc_loss:.4f}, "
+            f"GP={avg_gp:.4f}, "
+            f"G_adv={avg_gen_adv:.4f}, "
+            f"G_nll={avg_gen_nll:.4f}, "
+            f"G_recon={avg_gen_recon:.4f} (if used)"
+        )
 
-        if writer is not None:
-            writer.add_scalar("Epoch/D_loss", avg_disc_loss, epoch+1)
-            writer.add_scalar("Epoch/GP", avg_gp, epoch+1)
-            writer.add_scalar("Epoch/G_adv", avg_gen_adv, epoch+1)
-            writer.add_scalar("Epoch/G_nll", avg_gen_nll, epoch+1)
-            if use_recon:
-                writer.add_scalar("Epoch/G_recon", avg_gen_recon, epoch+1)
+        # On log les moyennes d'époque avec global_step
+        epoch_logs = {
+            "Epoch/D_loss": avg_disc_loss,
+            "Epoch/GP": avg_gp,
+            "Epoch/G_adv": avg_gen_adv,
+            "Epoch/G_nll": avg_gen_nll,
+        }
+        if use_recon:
+            epoch_logs["Epoch/G_recon"] = avg_gen_recon
+
+        wandb.log(epoch_logs, step=global_step)
 
         # ------------------
         # Visualisation
@@ -184,7 +209,7 @@ def train_wgangp_conditional(
         if (epoch+1) % visual_interval == 0:
             gen.eval()
             with torch.no_grad():
-                # On reuse le dernier batch (x,y) pour la visualisation
+                # On réutilise le dernier batch (x,y) pour la visualisation
                 sample_x = x[:1]     # (1, P, Alt, Cx)
                 sample_y = y[:1]     # (1, P, Alt, Cy)
                 sample_fake = gen.sample(sample_x)  # (1, P, Alt, Cy)
@@ -199,31 +224,39 @@ def train_wgangp_conditional(
                 axs[1].set_title("Fake (channel=0)")
                 plt.tight_layout()
 
-                if writer is not None:
-                    writer.add_figure("Real_vs_Fake", fig, global_step=epoch+1)
-                
+                # Conversion en image wandb avec global_step
+                wandb.log({"Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
+
                 plt.close(fig)
             gen.train()
 
-        # Sauvegarde checkpoints
-        gen_ckpt_path  = os.path.join(save_dir, f"gen_epoch_{epoch+1}.pth")
-        disc_ckpt_path = os.path.join(save_dir, f"disc_epoch_{epoch+1}.pth")
-        torch.save(gen.state_dict(), gen_ckpt_path)
-        torch.save(disc.state_dict(), disc_ckpt_path)
+        # Sauvegarde checkpoints avec global_step
+        checkpoint = {
+            'gen_state_dict': gen.state_dict(),
+            'disc_state_dict': disc.state_dict(),
+            'global_step': global_step
+        }
+        torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth"))
 
     print("Entraînement terminé.")
-
 
 def main():
     args = parse_arguments()
 
-    writer = SummaryWriter(log_dir=args.log_dir)
+    # Initialisation wandb
+    wandb.init(
+        project=args.wandb_project,
+        config=vars(args),  # enregistre tous les arguments
+    )
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Dataset
-    base_dir = "/home/deemel/pierre/dataset"  # ajustez
+    base_dir = "/home/ensta/ensta-cesar/dataset"  # Ajustez selon vos chemins
+    dataset_dir = "/home/ensta/ensta-cesar/ClimSim"
     dataset = ClimSimDataset(
         base_dir=base_dir,
+        dataset_dir=dataset_dir,  # Assurez-vous que l'argument est correct selon votre implémentation
         grid_file="ClimSim_low-res_grid-info.nc",
         normalize=True,
         data_split="train",
@@ -233,27 +266,39 @@ def main():
         ],
         cnn_reshape=True,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,num_workers=8)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=16)
 
-    # Instanciation G et D
+    # Générateur et Discriminateur
     gen = ConditionalFlowGenerator2d(
         context_channels=6, 
         latent_channels=10, 
-        num_flows=6 
+        num_flows=12 
     ).to(device)
+    
     disc = ConditionalWGANGPDiscriminator2d(
         in_channels_x=6, 
         in_channels_y=10, 
         #hidden_channels=[64,64,64]
     ).to(device)
 
+    # Initialisation de global_step
+    initial_step = 0
+
     # Reprise d'entraînement si spécifié
-    if args.resume_gen:
+    if args.resume_gen and args.resume_disc:
         print(f"==> Loading generator checkpoint from {args.resume_gen}")
-        gen.load_state_dict(torch.load(args.resume_gen, map_location=device))
-    if args.resume_disc:
         print(f"==> Loading discriminator checkpoint from {args.resume_disc}")
-        disc.load_state_dict(torch.load(args.resume_disc, map_location=device))
+        checkpoint = torch.load(args.resume_gen, map_location=device)
+        
+        if isinstance(checkpoint, dict):
+            gen.load_state_dict(checkpoint['gen_state_dict'])
+            disc.load_state_dict(checkpoint['disc_state_dict'])
+            initial_step = checkpoint.get('global_step', 0)
+        else:
+            # Si le checkpoint ne contient pas 'global_step', vous pouvez définir initial_step par ailleurs
+            gen.load_state_dict(checkpoint)
+            disc.load_state_dict(torch.load(args.resume_disc, map_location=device))
+            # initial_step reste à 0 ou définissez-le selon votre logique
 
     # Entraînement
     train_wgangp_conditional(
@@ -267,13 +312,14 @@ def main():
         alpha_nll=args.alpha_nll,
         gamma_clip=args.gamma_clip,
         visual_interval=args.visual_interval,
-        writer=writer,
         save_dir=args.save_dir,
         use_recon=args.use_recon,
-        alpha_recon=args.alpha_recon
+        alpha_recon=args.alpha_recon,
+        initial_step=initial_step  # Passer l'étape initiale
     )
 
-    writer.close()
+    # Fin de l'expérience wandb
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
