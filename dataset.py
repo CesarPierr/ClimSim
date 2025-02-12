@@ -1,120 +1,217 @@
-import os
-import xarray as xr
 import torch
 from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
 import numpy as np
+from typing import Dict, List, Tuple, Optional
+import xarray as xr
+from pathlib import Path
+import glob
 import logging
-from typing import Dict, Any
+import os
 
-from climsim_utils.data_utils import data_utils
+base_vars = {
+        'geopotential_500':'z',
+        '10m_u_component_of_wind':'u10',
+        '10m_v_component_of_wind':'v10',
+        '2m_temperature':'t2m',
+        'temperature_850':'t'
+}
 
-logging.basicConfig(level=logging.INFO)
+input_target_repartition = {
+    'input' : ['geopotential_500', 'temperature_850'],
+    'target' : ['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind']
+}
 
-class ClimSimDataset(Dataset):
-    def __init__(self, 
-                    base_dir: str,
-                    dataset_dir: str,
-                    grid_file: str,
-                    normalize: bool = True,
-                    data_split: str = 'train',
-                    regexps: list = None,
-                    cnn_reshape: bool = False,
-                    stride_sample: int = 1,):
+class ERADataset(Dataset):
+    """Custom Dataset for ERA climate data with optional normalization."""
+    
+    def __init__(
+        self,
+        root_dir,
+        years,
+        normalize = True,
+        vars = base_vars, 
+        input_target_repartition = input_target_repartition,
+        norm_params = None):  # Add norm_params parameter
 
         super().__init__()
-        self.base_dir = Path(base_dir).resolve()
-        dataset_dir = Path(dataset_dir).resolve()
-        norm_path = dataset_dir / 'ClimSim' / 'preprocessing' / 'normalizations'
+
+        self.root_dir = Path(root_dir)
+        self.years = years
+        self.vars = vars
         self.normalize = normalize
-        self.cnn_reshape = cnn_reshape
-
-        try:
-            grid_path = self.base_dir / grid_file
-            self.grid_ds = xr.open_dataset(grid_path, engine='netcdf4')
-
-            input_mean = xr.open_dataset(norm_path / 'inputs' / 'input_mean.nc', engine='netcdf4')
-            input_max  = xr.open_dataset(norm_path / 'inputs' / 'input_max.nc',  engine='netcdf4')
-            input_min  = xr.open_dataset(norm_path / 'inputs' / 'input_min.nc',  engine='netcdf4')
-            output_scale = xr.open_dataset(norm_path / 'outputs' / 'output_scale.nc', engine='netcdf4')
-        except Exception as e:
-            logging.error(f"Error loading required files: {e}")
-            raise
-
-        self.data = data_utils(
-            grid_info    = self.grid_ds,
-            input_mean   = input_mean,
-            input_max    = input_max,
-            input_min    = input_min,
-            output_scale = output_scale,
-            ml_backend   = "pytorch",
-            normalize    = normalize,
-        )
-        self.data.set_to_v1_vars()
         
-        self.data.data_path = str(self.base_dir / 'train')+'/'
-        self.data.set_regexps(
-            data_split=data_split,
-            regexps=regexps,
-        )
-        self.data.set_stride_sample(data_split, stride_sample=stride_sample)
-        self.data.set_filelist(data_split)
-        self.file_list = self.data.get_filelist(data_split)
-        if not self.file_list:
-            raise ValueError(f"No files found for split='{data_split}' under {self.data.data_path}")
-        logging.info(f"[{data_split} split] Found {len(self.file_list)} netCDF files.")
+        # Use provided norm_params or create new ones
+        self.norm_params = norm_params if norm_params is not None else {}
 
-    def __len__(self) -> int:
-        return len(self.file_list)
-    
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Load grid file
+        try:
+            grid_path = self.root_dir / 'constants' / 'constants.nc'
+            self.grid_ds = xr.open_dataset(grid_path, engine='netcdf4')
+        except Exception as e:
+            logging.error(f"Error loading constants files: {e}")
 
-        file_path = self.file_list[idx]
-        ds_input  = self.data.get_input(file_path)
-        ds_target = self.data.get_target(file_path)
-
-
+        # Extract coordinates and ensure float32 precision
+        self.lons = self.grid_ds['lon2d'].to_numpy().astype(np.float32)
+        self.lats = self.grid_ds['lat2d'].to_numpy().astype(np.float32)
+        
+        # Store coordinate normalization parameters only if not provided
+        if not self.norm_params:
+            self.norm_params['lon'] = {
+                'min': float(self.lons.min()),
+                'max': float(self.lons.max())
+            }
+            self.norm_params['lat'] = {
+                'min': float(self.lats.min()),
+                'max': float(self.lats.max())
+            }
+        
         if self.normalize:
-            ds_input  = (ds_input - self.data.input_mean) / (self.data.input_max - self.data.input_min)
-            ds_target = ds_target * self.data.output_scale
+            self.lons = ((self.lons - self.norm_params['lon']['min']) / 
+                        (self.norm_params['lon']['max'] - self.norm_params['lon']['min'])).astype(np.float32)
+            self.lats = ((self.lats - self.norm_params['lat']['min']) / 
+                        (self.norm_params['lat']['max'] - self.norm_params['lat']['min'])).astype(np.float32)
+        
+        self.data_vars = {}        
 
-        x = ds_input.stack(batch=('ncol',)).to_stacked_array('mlvar', sample_dims=['batch']).values
-        y = ds_target.stack(batch=('ncol',)).to_stacked_array('mlvar', sample_dims=['batch']).values
+        # Load dataset
+        for var in self.vars.keys():
+            self.data = []
+            list_file_var = os.listdir(self.root_dir / var)
+            key = self.vars[var]
+            for year in years:
+                try:
+                    file = [f for f in list_file_var if f'_{str(year)}_' in f][0]
+                    data_path = self.root_dir / var / file
+                    self.data.append(xr.open_dataset(data_path)[key].to_numpy().astype(np.float32))
+                except Exception as e:
+                    logging.error(f'No file found at year {year}: {e}')
 
-        if self.cnn_reshape:
-            x_cnn = self.data.reshape_input_for_cnn(x)  # shape (N, 60, 6)
-            y_cnn = self.data.reshape_target_for_cnn(y) # shape (N, 60, 10)
+            self.data_vars[var] = np.concatenate(self.data)
+            
+            # Store normalization parameters only if not provided
+            if not self.norm_params.get(var):
+                self.norm_params[var] = {
+                    'min': float(self.data_vars[var].min()),
+                    'max': float(self.data_vars[var].max())
+                }
+            
+            # Normalize if requested and ensure float32 precision
+            if self.normalize:
+                self.data_vars[var] = ((self.data_vars[var] - self.norm_params[var]['min']) / 
+                                     (self.norm_params[var]['max'] - self.norm_params[var]['min'])).astype(np.float32)
 
-            x = torch.from_numpy(x_cnn).float()
-            y = torch.from_numpy(y_cnn).float()  
-        else:
-            x = torch.from_numpy(x).float()
-            y = torch.from_numpy(y).float()
+        # Load constant masks
+        self.constant_masks = {}
+        for key in ['orography', 'lsm', 'slt']:
+            data = self.grid_ds[key].to_numpy().astype(np.float32)
+            if not self.norm_params.get(key):
+                self.norm_params[key] = {
+                    'min': float(data.min()),
+                    'max': float(data.max())
+                }
+            if self.normalize:
+                data = ((data - self.norm_params[key]['min']) / 
+                       (self.norm_params[key]['max'] - self.norm_params[key]['min'])).astype(np.float32)
+            self.constant_masks[key] = torch.from_numpy(data).float()
+        self.constant_masks = torch.stack(list(self.constant_masks.values()))
 
+        # Load and process time
+        time = []
+        for year in years:
+            list_file_var = os.listdir(self.root_dir / 'geopotential_500')
+            file = [f for f in list_file_var if f'_{str(year)}_' in f][0]
+            data_path = self.root_dir / 'geopotential_500' / file
+            time.append(xr.open_dataset(data_path)['time'].to_numpy())
+            
+        time = np.concatenate(time)
+        self.time = ((time - np.datetime64('1979-01-01')) / np.timedelta64(1, 'h')).astype(np.float32)
+        
+        # Store time normalization parameters only if not provided
+        if not self.norm_params.get('time'):
+            self.norm_params['time'] = {
+                'min': float(self.time.min()),
+                'max': float(self.time.max())
+            }
+        
+        if self.normalize:
+            self.time = ((self.time - self.norm_params['time']['min']) / 
+                        (self.norm_params['time']['max'] - self.norm_params['time']['min'])).astype(np.float32)
+        
+        # Prepare input and target tensors
+        input_list = []
+        for key in input_target_repartition['input']:
+            input_list.append(torch.from_numpy(self.data_vars[key]).float())
+        self.input = torch.stack(input_list, dim=-1).permute(0, 3, 1, 2)
+
+        target_list = []
+        for key in input_target_repartition['target']:
+            target_list.append(torch.from_numpy(self.data_vars[key]).float())
+        self.target = torch.stack(target_list, dim=-1).permute(0, 3, 1, 2)
+        
+        # Convert coordinates to torch tensors in float32
+        self.lons = torch.from_numpy(self.lons).float()
+        self.lats = torch.from_numpy(self.lats).float()
+    
+    def denormalize(self, data: torch.Tensor, var_name: str) -> torch.Tensor:
+        """Denormalize data using stored parameters."""
+        if not self.normalize:
+            return data
+        params = self.norm_params[var_name]
+        return (data * (params['max'] - params['min']) + params['min']).float()  # Ensure float32
+    
+    def get_norm_params(self) -> Dict:
+        """Return normalization parameters."""
+        return self.norm_params
+    
+    def __len__(self):
+        return len(self.input)
+    
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+            
         return {
-            "input": x,
-            "target": y,  
-            "file_path": str(file_path),
+            'input': self.input[idx],  # [32, 64, 2]
+            'target': self.target[idx],  # [32, 64, 3]
+            'coords': [
+                self.lons,  
+                self.lats, 
+                self.time[idx]],
+            'masks': self.constant_masks,  # Dictionary of constant masks
+            'norm_params': self.norm_params  # Normalization parameters
         }
 
-if __name__ == "__main__":
-
-    base_dir = "/home/deemel/pierre/dataset"  
-
-    dataset = ClimSimDataset(
-        base_dir = base_dir,
-        grid_file = "ClimSim_low-res_grid-info.nc",
-        normalize = True,
-        data_split = "train",  
-        regexps = [
-            "E3SM-MMF.mli.000[1234567]-*-*-*.nc", 
-            "E3SM-MMF.mli.0008-01-*-*.nc",
-        ],
-        cnn_reshape = True,
-    )
-    dataloader = DataLoader(dataset, batch_size=32, num_workers=4, shuffle=True)
-
-    batch = next(iter(dataloader))
-    x, y = batch["input"], batch["target"]
-    print(f"Input shape: {x.shape}, Target shape: {y.shape}")
+def load_dataset(
+    nb_file, 
+    train_val_split = None, 
+    year0=1979, 
+    root_dir="./data/era_5_data",
+    normalize=True):
     
+    datasets = {
+        'train': None,
+        'val': None
+    }
+    
+    if not train_val_split:
+        years = np.arange(year0, year0 + nb_file, 1, dtype=np.int32)
+        datasets['train'] = ERADataset(root_dir=root_dir, years=years, normalize=normalize)
+
+    else:
+        nb_train = np.floor(nb_file * train_val_split).astype(np.int32)
+        nb_val = nb_file - nb_train
+        years_train = np.arange(year0, year0 + nb_train, 1, dtype=np.int32)
+        years_val = np.arange(year0 + nb_train, year0 + nb_train + nb_val, dtype=np.int32)
+        
+        # First create training dataset to get normalization parameters
+        datasets['train'] = ERADataset(root_dir=root_dir, years=years_train, normalize=normalize)
+        
+        # Create validation dataset using training normalization parameters
+        datasets['val'] = ERADataset(
+            root_dir=root_dir, 
+            years=years_val, 
+            normalize=normalize,
+            norm_params=datasets['train'].get_norm_params()  # Pass training normalization parameters
+        )
+
+    return datasets

@@ -260,7 +260,7 @@ class ConditionalWGANGPDiscriminator2d(nn.Module):
             layers.append(nn.BatchNorm2d(inC))
             layers.append(nn.Conv2d(inC, hc, kernel_size=ker, padding=pad))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
-            layers.append(nn.Dropout2d(0.25))
+            layers.append(nn.Dropout2d(0.1))
             inC = hc
         self.conv = nn.Sequential(*layers)
         self.fc = nn.Linear(hidden_channels_params[-1][0], 1)

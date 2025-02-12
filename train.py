@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 import wandb
 from PIL import Image  # Import nécessaire pour manipuler les images PIL
-from dataset import ClimSimDataset
+from dataset import ERADataset, load_dataset
 from models import (
     ConditionalFlowGenerator2d,
     ConditionalWGANGPDiscriminator2d,
@@ -29,7 +29,7 @@ def parse_arguments():
     parser.add_argument("--resume_gen", type=str, default="", help="Path to a generator checkpoint to resume from.")
     parser.add_argument("--resume_disc", type=str, default="", help="Path to a discriminator checkpoint to resume from.")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save model checkpoints.")
-    parser.add_argument("--num_epochs", type=int, default=50, help="Number of epochs to train.")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs to train.")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size.")
     parser.add_argument("--lambda_gp", type=float, default=10.0, help="Gradient penalty coefficient.")
@@ -55,14 +55,73 @@ def fig_to_wandb_image(fig):
     image = Image.open(buf).convert("RGB")  # Conversion en image RGB pour éviter les problèmes de mode
     return wandb.Image(image)  # Passe l'image PIL à wandb.Image
 
+
+def validate(gen, val_loader, device):
+    """
+    Simple validation loop: computes MSE between generator output and target
+    for the entire val dataset.
+    Returns average MSE and optionally a single example for visualization.
+    """
+    gen.eval()
+    total_mse = 0.0
+    n_samples = 0
+    
+    example_x = None
+    example_y = None
+    example_fake = None
+
+    with torch.no_grad():
+        for batch_data in tqdm(val_loader, desc="[Validation]", leave=False):
+            inputs = batch_data["input"].to(device)
+            masks = batch_data["masks"].to(device)
+            lat = batch_data["coords"][0].unsqueeze(1).to(device)
+            lon = batch_data["coords"][1].unsqueeze(1).to(device)
+
+            coords = torch.concat([lat, lon], 1)
+            x = torch.cat([inputs, masks, coords], dim=1)  # (B, Cx+..., lat, lon)
+            y = batch_data["target"].to(device)
+
+            # In your code you do x = x.permute(0,3,2,1) etc. for the flow model
+            # So let's keep that consistent:
+            x = x.permute(0, 3, 2, 1)  
+            y = y.permute(0, 3, 2, 1)
+
+            fake = gen.sample(x)  # shape: (B, lon, lat, Cy)
+
+            # Compute MSE
+            loss_mse = F.mse_loss(fake, y, reduction='sum')
+            total_mse += loss_mse.item()
+            n_samples += y.numel()
+
+            # Save the first batch as example for visualization
+            if example_x is None:
+                example_x = x[0:1].cpu()
+                example_y = y[0:1].cpu()
+                example_fake = fake[0:1].cpu()
+
+    avg_mse = total_mse / n_samples if n_samples > 0 else 0.0
+    gen.train()  # back to train mode
+
+    return avg_mse, (example_x, example_y, example_fake)
+
+
+def fig_to_wandb_image(fig):
+    """Convert a Matplotlib figure into a wandb.Image."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches='tight')
+    buf.seek(0)
+    image = Image.open(buf).convert("RGB")
+    return wandb.Image(image)
+
 def train_wgangp_conditional(
     gen,
     disc,
     loader,
+    val_loader,  # <== new
     device,
     num_epochs=10,
     lr=1e-4,
-    lr_discr=1e-5,
+    lr_discr=1e-4,
     lambda_gp=10.0,
     alpha_nll=1.0,
     gamma_clip=1.0,
@@ -70,13 +129,9 @@ def train_wgangp_conditional(
     save_dir="checkpoints",
     use_recon=False,
     alpha_recon=1.0,
-    initial_step=0  # Ajout d'un paramètre pour initialiser global_step
+    initial_step=0
 ):
-    """
-    Entraînement du WGAN-GP conditionnel avec Flow + (optionnel) Reconstruction MSE.
-    On log aussi des métriques (moyenne, variance) pour détecter un éventuel mode collapse, 
-    mais tout se fait via wandb.
-    """
+    import os
     os.makedirs(save_dir, exist_ok=True)
 
     opt_gen = torch.optim.Adam(gen.parameters(), lr=lr, betas=(0.5, 0.9))
@@ -85,7 +140,8 @@ def train_wgangp_conditional(
     gen.train()
     disc.train()
 
-    global_step = initial_step  # Initialisation de global_step
+    global_step = initial_step
+
     for epoch in range(num_epochs):
         epoch_disc_loss = 0.0
         epoch_gen_adv   = 0.0
@@ -94,20 +150,29 @@ def train_wgangp_conditional(
         epoch_gp        = 0.0
 
         for batch_data in tqdm(loader, desc=f"[Epoch {epoch+1}/{num_epochs}]", total=len(loader)):
-            x = batch_data["input"].to(device)   # (B, Pos, Alt, Cx)
-            y = batch_data["target"].to(device)  # (B, Pos, Alt, Cy)
+            # === Prepare data for generator / disc
+            inputs = batch_data["input"].to(device)
+            mask = batch_data["masks"].to(device)
+            lat = batch_data["coords"][0].unsqueeze(1).to(device)
+            lon = batch_data["coords"][1].unsqueeze(1).to(device)
+            coords = torch.concat([lat, lon], 1)
+            x = torch.cat([inputs, mask, coords], dim=1)
+            y = batch_data["target"].to(device)
 
-            B, P, Alt, Cy = y.shape
-            total_dims = float(P * Alt * Cy)
+            # Permute to shape (B, lon, lat, channels)
+            x = x.permute(0, 3, 2, 1)
+            y = y.permute(0, 3, 2, 1)
+            _, n_lon, n_lat, Cy = y.shape
+            total_dims = float(n_lon * n_lat * Cy)
 
             # ----------------------
-            #   1) Discriminateur
+            # (1) Discriminator
             # ----------------------
             fake = gen.sample(x).detach()
             disc_real = disc(x, y)
             disc_fake = disc(x, fake)
 
-            loss_d = -(disc_real.mean() - disc_fake.mean())  # WGAN
+            loss_d = -(disc_real.mean() - disc_fake.mean())
             gp = gradient_penalty_conditional(disc, x, y, fake, device, lambda_gp=lambda_gp)
             loss_d_total = loss_d + gp
 
@@ -120,7 +185,7 @@ def train_wgangp_conditional(
             epoch_gp        += gp.item()
 
             # ----------------------
-            #   2) Générateur
+            # (2) Generator
             # ----------------------
             fake2 = gen.sample(x)
             disc_fake2 = disc(x, fake2)
@@ -145,9 +210,8 @@ def train_wgangp_conditional(
             epoch_gen_nll += loss_nll.item()
 
             # ----------------------
-            #   3) Logging wandb
+            # (3) Logging to wandb
             # ----------------------
-            # On loggue les scalaires avec global_step
             logs = {
                 "Train/Discriminator": loss_d.item(),
                 "Train/GP": gp.item(),
@@ -157,12 +221,12 @@ def train_wgangp_conditional(
             if use_recon:
                 logs["Train/Generator_Recon"] = loss_recon.item()
 
-            # (optionnel) Suivi de la moyenne/variance Real vs Fake
+            # Mean/var diffs
             with torch.no_grad():
-                real_mean = y.mean(dim=(1,2,3))     # (B,)
-                real_var  = y.var(dim=(1,2,3))      # (B,)
-                fake_mean = fake2.mean(dim=(1,2,3)) # (B,)
-                fake_var  = fake2.var(dim=(1,2,3))  # (B,)
+                real_mean = y.mean(dim=(1,2,3))
+                real_var  = y.var(dim=(1,2,3))
+                fake_mean = fake2.mean(dim=(1,2,3))
+                fake_var  = fake2.var(dim=(1,2,3))
 
                 mean_diff = (real_mean - fake_mean).abs().mean()
                 var_diff  = (real_var - fake_var).abs().mean()
@@ -171,10 +235,9 @@ def train_wgangp_conditional(
             logs["Dist/Var_diff"]  = var_diff.item()
 
             wandb.log(logs, step=global_step)
-
             global_step += 1
 
-        # Moyennes sur l'époque
+        # End epoch => compute average losses
         nb_batches = len(loader)
         avg_disc_loss = epoch_disc_loss / nb_batches
         avg_gp        = epoch_gp / nb_batches
@@ -191,7 +254,7 @@ def train_wgangp_conditional(
             f"G_recon={avg_gen_recon:.4f} (if used)"
         )
 
-        # On log les moyennes d'époque avec global_step
+        # Log epoch averages
         epoch_logs = {
             "Epoch/D_loss": avg_disc_loss,
             "Epoch/GP": avg_gp,
@@ -203,16 +266,36 @@ def train_wgangp_conditional(
 
         wandb.log(epoch_logs, step=global_step)
 
-        # ------------------
-        # Visualisation
-        # ------------------
+        # ---------------------------------
+        #  Validation Step every 5 epochs
+        # ---------------------------------
+        if (epoch + 1) % 5 == 0 and val_loader is not None:
+            val_mse, (val_x, val_y, val_fake) = validate(gen, val_loader, device)
+            wandb.log({"Val/MSE": val_mse}, step=global_step)
+
+            # produce a small static figure with real vs. fake 
+            # channel = 0 as an example
+            real_2d = val_y[0, :, :, 0].numpy()
+            fake_2d = val_fake[0, :, :, 0].numpy()
+
+            fig, axs = plt.subplots(1, 2, figsize=(10,4))
+            im1 = axs[0].imshow(real_2d.T, aspect='auto', origin='lower')
+            axs[0].set_title("Val: Real (ch=0)")
+            im2 = axs[1].imshow(fake_2d.T, aspect='auto', origin='lower')
+            axs[1].set_title("Val: Fake (ch=0)")
+            plt.tight_layout()
+            # log to wandb
+            wandb.log({"Val/Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
+            plt.close(fig)
+
+        # Visualize training sample every `visual_interval` epochs
         if (epoch+1) % visual_interval == 0:
             gen.eval()
             with torch.no_grad():
-                # On réutilise le dernier batch (x,y) pour la visualisation
-                sample_x = x[:1]     # (1, P, Alt, Cx)
-                sample_y = y[:1]     # (1, P, Alt, Cy)
-                sample_fake = gen.sample(sample_x)  # (1, P, Alt, Cy)
+                # Reuse last batch from loader or make a new sample
+                sample_x = x[:1]     
+                sample_y = y[:1]     
+                sample_fake = gen.sample(sample_x)
 
                 real_2d = sample_y[0, :, :, 0].cpu().numpy()
                 fake_2d = sample_fake[0, :, :, 0].cpu().numpy()
@@ -224,13 +307,12 @@ def train_wgangp_conditional(
                 axs[1].set_title("Fake (channel=0)")
                 plt.tight_layout()
 
-                # Conversion en image wandb avec global_step
-                wandb.log({"Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
-
+                wandb.log({"Train/Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
                 plt.close(fig)
+
             gen.train()
 
-        # Sauvegarde checkpoints avec global_step
+        # Save checkpoint
         checkpoint = {
             'gen_state_dict': gen.state_dict(),
             'disc_state_dict': disc.state_dict(),
@@ -238,7 +320,7 @@ def train_wgangp_conditional(
         }
         torch.save(checkpoint, os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth"))
 
-    print("Entraînement terminé.")
+    print("Training finished.")
 
 def main():
     args = parse_arguments()
@@ -252,32 +334,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Dataset
-    base_dir = "/home/ensta/ensta-cesar/dataset"  # Ajustez selon vos chemins
-    dataset_dir = "/home/ensta/ensta-cesar/ClimSim"
-    dataset = ClimSimDataset(
-        base_dir=base_dir,
-        dataset_dir=dataset_dir,  # Assurez-vous que l'argument est correct selon votre implémentation
-        grid_file="ClimSim_low-res_grid-info.nc",
-        normalize=True,
-        data_split="train",
-        regexps=[
-            "E3SM-MMF.mli.000[1234567]-*-*-*.nc",
-            "E3SM-MMF.mli.0008-01-*-*.nc",
-        ],
-        cnn_reshape=True,
+    dataset_dir = "/home/ensta/ensta-louvard/projet_IA/PINN_Climate/data/era_5_data"
+    datasets = load_dataset(
+        nb_file=10, 
+        train_val_split=0.8, 
+        year0=1979, 
+        root_dir=dataset_dir,
+        normalize=True
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=16)
+    train_loader = DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True, num_workers=16)
+    val_loader = DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False, num_workers=5)
 
     # Générateur et Discriminateur
     gen = ConditionalFlowGenerator2d(
-        context_channels=6, 
-        latent_channels=10, 
-        num_flows=8 
+        context_channels=7, 
+        latent_channels=3, 
+        num_flows=8
     ).to(device)
     
     disc = ConditionalWGANGPDiscriminator2d(
-        in_channels_x=6, 
-        in_channels_y=10, 
+        in_channels_x=7, 
+        in_channels_y=3, 
         #hidden_channels=[64,64,64]
     ).to(device)
 
@@ -304,7 +381,8 @@ def main():
     train_wgangp_conditional(
         gen=gen,
         disc=disc,
-        loader=loader,
+        loader=train_loader,
+        val_loader=val_loader,
         device=device,
         num_epochs=args.num_epochs,
         lr=args.lr,
