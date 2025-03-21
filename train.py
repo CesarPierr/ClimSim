@@ -201,17 +201,11 @@ def validate(gen, val_loader, device, norm_params=None, log_wandb=True, generate
             
             
             
-            wind_pred[:, 0] = denormalize_variable(wind_pred[:, 0], norm_params['10m_u_component_of_wind'])
+            
             wind_real[:, 0] = denormalize_variable(wind_real[:, 0], norm_params['10m_u_component_of_wind'])
-            wind_pred[:, 1] = denormalize_variable(wind_pred[:, 1], norm_params['10m_v_component_of_wind'])
             wind_real[:, 1] = denormalize_variable(wind_real[:, 1], norm_params['10m_v_component_of_wind'])
-            
-            
-            wind_pred[:, 0] = (wind_pred[:, 0] - wind_real[:, 0].min()) / (wind_real[:, 0].max() - wind_real[:, 0].min())
-            wind_pred[:, 1] = (wind_pred[:, 1] - wind_real[:, 1].min()) / (wind_real[:, 1].max() - wind_real[:, 1].min())
-
-
-            
+            wind_pred[:, 0] = denormalize_variable(wind_pred[:, 0], norm_params['10m_u_component_of_wind'])
+            wind_pred[:, 1] = denormalize_variable(wind_pred[:, 1], norm_params['10m_v_component_of_wind'])
         
         
         print("Wind pred min:", wind_pred.min(), wind_pred.max())
