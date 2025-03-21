@@ -62,11 +62,8 @@ class PNet2d(nn.Module):
         => on retranspose => (B, P, A, 2*outC)
         => on split => mu, sigma
         """
-        B, P, A, Cin = x.shape
-        # Permute => (B, Cin, P, A)
         x = x.permute(0, 3, 1, 2)
         out = self.conv2d(x)  # => (B, 2*outC, P, A)
-        # Retranspose => (B, P, A, 2*outC)
         out = out.permute(0, 2, 3, 1)  
         mu, log_sigma = torch.chunk(out, 2, dim=-1)
         log_sigma = torch.clamp(log_sigma, min=-10, max=10)
@@ -87,7 +84,6 @@ class KNet2d(nn.Module):
         layers.append(nn.Conv2d(hidden_channels[0], hidden_channels[1], kernel_size=3, padding=1))
         layers.append(nn.BatchNorm2d(hidden_channels[1]))
         layers.append(nn.LeakyReLU())
-        # Bloc final
         layers.append(nn.Conv2d(hidden_channels[1], out_channels, kernel_size=3, padding=1))
 
         self.conv2d = nn.Sequential(*layers)
@@ -95,10 +91,6 @@ class KNet2d(nn.Module):
     def forward(self, x):
         """
         x.shape = (B, P, A, Cin)
-        => permute => (B, Cin, P, A)
-        => conv2d => (B, out_channels, P, A)
-        => retranspose => (B, P, A, out_channels)
-        => softplus
         """
         B, P, A, Cin = x.shape
         x = x.permute(0, 3, 1, 2)           # => (B, Cin, P, A)
@@ -153,8 +145,7 @@ class ConditionalAffineFlow2d(nn.Module):
         b = self.b_net(x)  # => (B, P, A, latent_channels)
 
         z_out = k * z + b
-        # log_det pixel-wise = sum(log(k_ijc)) => en fait c'est la log-det par canal,
-        # mais on la conserve "canal-wise" si on veut. On NE sum PAS sur (P,A,C).
+
         log_det_pixelwise = torch.log(k + self.eps)  # => (B, P, A, C)
 
         return z_out, log_det_pixelwise
@@ -207,6 +198,16 @@ class ConditionalFlowGenerator2d(nn.Module):
         Génère un échantillon final dans l'espace y, en forward.
         """
         z, _, _, _ = self.forward(x)
+        return z
+    
+    def sample_mode(self, x):
+        """
+        Génère le sample le plus probable (mode) en utilisant mu sans bruit.
+        """
+        mu, _ = self.p_net(x)  # Use only the mean
+        z = mu  # deterministic sample: most likely latent vector
+        for flow in self.flows:
+            z, _ = flow(z, x)
         return z
 
     def log_prob(self, y, x):

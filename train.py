@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
 import wandb
-from PIL import Image  # Pour manipuler les images PIL
+from PIL import Image  
 
 from dataset import load_dataset
 from models import (
@@ -24,7 +24,7 @@ from models import (
     ConditionalWGANGPDiscriminator2d,
     gradient_penalty_conditional,
 )
-from visu import compute_animation_for_scalars, compute_animation_for_vectors
+from visu import compute_animation_for_scalar, compute_animation_for_vector, denormalize_variable, compute_animation_for_temperature_difference, compute_animation_for_vector_difference, transform_longitude
 from torch_uncertainty.metrics import AUSE
 
 ause_metric = AUSE()
@@ -59,13 +59,21 @@ def fig_to_wandb_image(fig):
     image = Image.open(buf).convert("RGB")
     return wandb.Image(image)
 
-def validate(gen, val_loader, device, log_wandb=True, generate_video=False, fps=48):
+def validate(gen, val_loader, device, norm_params=None, log_wandb=True, generate_video=False, fps=48, year=2000):
     """
-    Ici, en plus de la validation habituelle (MSE globale, animations temp/vent),
-    on génère DEUX animations supplémentaires pour l'incertitude:
-      - (Temp) incert_pred vs incert_real
-      - (Vent) incert_pred vs incert_real
+    Validation function that computes the global MSE and uncertainty (AUSE) metrics,
+    and—if requested—produces videos comparing denormalized predictions and ground truth.
+    
+    Assumes that:
+      - Channel 0 is temperature (in normalized Kelvin, later converted to Celsius),
+      - Channels 1 and 2 are wind components.
+    
+    norm_params is a dict with keys:
+      '2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind'
+    that contain the corresponding min/max values.
     """
+    if norm_params is None:
+        norm_params = val_loader.dataset.get_norm_params()
     gen.eval()
     total_mse = 0.0
     n_samples = 0
@@ -74,169 +82,239 @@ def validate(gen, val_loader, device, log_wandb=True, generate_video=False, fps=
     example_y = None
     example_fake = None
 
-    # On accumule pour la vidéo "classique" de la prédiction
+    
     all_fakes = []
     all_reals = []
-
-    # On accumule pour l'incertitude température (canal 0)
+    
+    
     all_incert_temp_pred = []
     all_incert_temp_real = []
-
-    # On accumule pour l'incertitude vent (canaux 1,2)
     all_incert_wind_pred = []
     all_incert_wind_real = []
+    
+    
+    ause_metric_temp = AUSE()
+    ause_metric_wind = AUSE()
 
+    
     with torch.no_grad():
         for batch_data in tqdm(val_loader, desc="[Validation]", leave=False):
             inputs = batch_data["input"].to(device)
             masks = batch_data["masks"].to(device)
-            lat = batch_data["coords"][0].unsqueeze(1).to(device)
-            lon = batch_data["coords"][1].unsqueeze(1).to(device)
-            time = batch_data["coords"][2].unsqueeze(1).to(device)
-            coords = torch.concat([lat, lon], 1)
-            x = torch.cat([inputs, masks, coords], dim=1)  # (B, C_in, lat, lon)
+            lat_coord = batch_data["coords"][0].unsqueeze(1).to(device)
+            lon_coord = batch_data["coords"][1].unsqueeze(1).to(device)
+            
+            _ = batch_data["coords"][2].unsqueeze(1).to(device)
+            coords = torch.cat([lat_coord, lon_coord], dim=1)
+            x = torch.cat([inputs, masks, coords], dim=1)
             y = batch_data["target"].to(device)
 
-            # Permute => (B, lon, lat, C)
+            
             x = x.permute(0, 3, 2, 1)
             y = y.permute(0, 3, 2, 1)
 
-            # Prédiction
-            fake = gen.sample(x)  # => (B, lon, lat, Cy)
+            
+            fake = gen.sample_mode(x)
             all_fakes.append(fake.cpu())
             all_reals.append(y.cpu())
 
-            # MSE globale
+            
             loss_mse = F.mse_loss(fake, y, reduction='sum')
             total_mse += loss_mse.item()
             n_samples += y.numel()
 
+            
             if example_x is None:
                 example_x = x[0:1].cpu()
                 example_y = y[0:1].cpu()
                 example_fake = fake[0:1].cpu()
 
-            # -- Incertitudes pixel-wise --
-            # On suppose gen.log_prob(...) => shape (B, lon, lat, Cy)
-            lp_px = gen.log_prob(y, x)  # log p(y|x), pixel-wise
+            
+            lp_px = gen.log_prob(y, x)
 
-            # (A) Température = channel=0
-            # incert_pred_temp = - log-prob (plus c'est grand, plus c'est "incertain")
-            incert_pred_temp = -lp_px[..., 0]  # => (B, lon, lat)
-            # incert_real_temp = L1 => |fake - y| sur le channel 0
+            
+            incert_pred_temp = -lp_px[..., 0]
             incert_real_temp = (fake[..., 0] - y[..., 0]).abs()
-
             all_incert_temp_pred.append(incert_pred_temp.cpu())
             all_incert_temp_real.append(incert_real_temp.cpu())
+            ause_metric_temp.update(incert_pred_temp.reshape(-1), incert_real_temp.reshape(-1))
 
-            # (B) Vent = channels 1,2
-            # incert_pred_wind = - moyenne( log-prob sur canaux 1,2 )
-            incert_pred_wind = -(lp_px[..., 1:].mean(dim=-1))  # => (B, lon, lat)
-            # incert_real_wind = norme de l'erreur sur canaux 1,2
-            # => sqrt( (u_pred-u_true)^2 + (v_pred-v_true)^2 )
+            
+            incert_pred_wind = -(lp_px[..., 1:].mean(dim=-1))
             diff_u = (fake[..., 1] - y[..., 1])
             diff_v = (fake[..., 2] - y[..., 2])
             incert_real_wind = torch.sqrt(diff_u**2 + diff_v**2)
-
             all_incert_wind_pred.append(incert_pred_wind.cpu())
             all_incert_wind_real.append(incert_real_wind.cpu())
+            ause_metric_wind.update(incert_pred_wind.reshape(-1), incert_real_wind.reshape(-1))
+            
+
 
     avg_mse = total_mse / n_samples if n_samples > 0 else 0.0
+    final_ause_temp = ause_metric_temp.compute()
+    final_ause_wind = ause_metric_wind.compute()
 
-    # -- Génération des vidéos --
+    if log_wandb:
+        wandb.log({
+            "Val/MSE": avg_mse,
+            "Val/AUSE_Temp": final_ause_temp,
+            "Val/AUSE_Wind": final_ause_wind,
+        })
+
+    
     if generate_video and len(all_fakes) > 0:
-        # 1) Concaténer
-        fakes_concat = torch.cat(all_fakes, dim=0)  # (N, lon, lat, Cy)
-        reals_concat = torch.cat(all_reals, dim=0)  # (N, lon, lat, Cy)
+        
+        fakes_concat = torch.cat(all_fakes, dim=0)  
+        reals_concat = torch.cat(all_reals, dim=0)
 
-        fakes_concat = fakes_concat.permute(3, 0, 2, 1)  # => (Cy, N, lat, lon)
-        reals_concat = reals_concat.permute(3, 0, 2, 1)
+        fakes_concat = fakes_concat.permute(0, 3, 2, 1).cpu().numpy()  
+        reals_concat = reals_concat.permute(0, 3, 2, 1).cpu().numpy()
 
-        # => Temp (channel=0)
-        temp_pred = fakes_concat[0].cpu().numpy()  # (N, lat, lon)
-        temp_real = reals_concat[0].cpu().numpy()  # (N, lat, lon)
+        fakes_concat= transform_longitude(fakes_concat)
+        reals_concat = transform_longitude(reals_concat)
+        
+        
+        temp_pred = fakes_concat[:, 0]
+        temp_real = reals_concat[:, 0]
+        print("Temperature pred min before:", temp_pred.min(), temp_pred.max())
+        print("Temperature real min before:", temp_real.min(), temp_real.max())
+        
+        if val_loader.dataset.normalize:
+            temp_pred = denormalize_variable(temp_pred, norm_params['2m_temperature']) - 273.15
+            temp_real = denormalize_variable(temp_real, norm_params['2m_temperature']) - 273.15
 
-        # => Vent (channels=1,2)
-        wind_pred = fakes_concat[1:].cpu().numpy()  # shape (2, N, lat, lon)
-        wind_real = reals_concat[1:].cpu().numpy()  # shape (2, N, lat, lon)
+            
+        else :
+            temp_pred -= 273.15
+            temp_real -= 273.15
+        
+        
+        print("Temperature pred min:", temp_pred.min(), temp_pred.max())
+        print("Temperature real min:", temp_real.min(), temp_real.max())
+        wind_pred = fakes_concat[:, 1:3]
+        wind_real = reals_concat[:, 1:3]
 
-        N = min(temp_pred.shape[0], 480)  # limiter à 480 frames
+        
+        print("Wind pred min before:", wind_pred.min(), wind_pred.max())
+        print("Wind real min before:", wind_real.min(), wind_real.max())
+        if val_loader.dataset.normalize:
+            
+            
+            
+            wind_pred[:, 0] = denormalize_variable(wind_pred[:, 0], norm_params['10m_u_component_of_wind'])
+            wind_real[:, 0] = denormalize_variable(wind_real[:, 0], norm_params['10m_u_component_of_wind'])
+            wind_pred[:, 1] = denormalize_variable(wind_pred[:, 1], norm_params['10m_v_component_of_wind'])
+            wind_real[:, 1] = denormalize_variable(wind_real[:, 1], norm_params['10m_v_component_of_wind'])
+            
+            
+            wind_pred[:, 0] = (wind_pred[:, 0] - wind_real[:, 0].min()) / (wind_real[:, 0].max() - wind_real[:, 0].min())
+            wind_pred[:, 1] = (wind_pred[:, 1] - wind_real[:, 1].min()) / (wind_real[:, 1].max() - wind_real[:, 1].min())
 
-        # (i) Température
-        temp_stacked = np.stack([temp_pred, temp_real], axis=0)  # => (2, N, lat, lon)
-        temp_stacked = temp_stacked[:, :N]
-        compute_animation_for_scalars(
-            scalars=temp_stacked,
-            save_path='val_temp_animation.mp4',
-            titles=['temperature_pred', 'temperature_real'],
-            cbar_label='Temperature (°C)',
-            fps=fps,
-            log_wandb=log_wandb
+
+            
+        
+        
+        print("Wind pred min:", wind_pred.min(), wind_pred.max())
+        print("Wind real min:", wind_real.min(), wind_real.max())
+        nlat = temp_pred.shape[1]
+        nlon = temp_pred.shape[2]
+        lat_vals = np.linspace(-90, 90, nlat)
+        lon_vals = np.linspace(-180, 180, nlon)
+
+        
+        N = min(temp_pred.shape[0], 24)
+
+        
+        compute_animation_for_scalar(
+            true_data=temp_real[:N],
+            predicted_data=temp_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Temperature (°C)",
+            save_path="val_temperature_prediction.mp4",
+            year=year,
+            fps=fps
         )
 
-        # (ii) Vent
-        wind_stacked = np.stack([wind_pred, wind_real], axis=0)  # => (2, 2, N, lat, lon)
-        wind_stacked = wind_stacked.transpose(0, 2, 1, 3, 4)     # => (2, N, 2, lat, lon)
-        wind_stacked = wind_stacked[:, :N]
-        compute_animation_for_vectors(
-            vectors=wind_stacked,
-            save_path='val_wind_animation.mp4',
-            titles=['wind_pred', 'wind_real'],
-            cbar_label='Wind (m/s)',
-            fps=fps,
-            log_wandb=log_wandb
+        compute_animation_for_temperature_difference(
+            true_data=temp_real[:N],
+            predicted_data=temp_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Temperature (°C)",
+            save_path="val_temperature_difference.mp4",
+            year=year,
+            fps=fps
         )
 
-        # -- InCERTITUDES --
-        # On concatène tout
-        temp_incert_pred_cat = torch.cat(all_incert_temp_pred, dim=0)   # (N, lon, lat)
-        temp_incert_real_cat = torch.cat(all_incert_temp_real, dim=0)   # (N, lon, lat)
-        wind_incert_pred_cat = torch.cat(all_incert_wind_pred, dim=0)   # (N, lon, lat)
-        wind_incert_real_cat = torch.cat(all_incert_wind_real, dim=0)   # (N, lon, lat)
-
-        # reorder => (N, lat, lon)
-        # car compute_animation_for_scalars attend (n_subplots, T, lat, lon)
-        temp_incert_pred_cat = temp_incert_pred_cat.permute(0,2,1)  # => (N, lat, lon)
-        temp_incert_real_cat = temp_incert_real_cat.permute(0,2,1)
-        wind_incert_pred_cat = wind_incert_pred_cat.permute(0,2,1)
-        wind_incert_real_cat = wind_incert_real_cat.permute(0,2,1)
-
-        # Limiter à N frames
-        temp_incert_pred_cat = temp_incert_pred_cat[:N]
-        temp_incert_real_cat = temp_incert_real_cat[:N]
-        wind_incert_pred_cat = wind_incert_pred_cat[:N]
-        wind_incert_real_cat = wind_incert_real_cat[:N]
-
-        # (iii) Incertitude Temp : 2 subplots => [incert_pred, incert_real]
-        temp_incert_stacked = torch.stack(
-            [temp_incert_pred_cat, temp_incert_real_cat], dim=0
-        )  # => (2, N, lat, lon)
-
-        compute_animation_for_scalars(
-            scalars=temp_incert_stacked.numpy(),
-            save_path='val_temp_incert_animation.mp4',
-            titles=['temp_incert_pred (NLL)', 'temp_incert_real (L1)'],
-            cbar_label='Uncertainty (Temp)',
-            fps=fps,
-            log_wandb=log_wandb
+        
+        compute_animation_for_vector(
+            true_vector_data=wind_real[:N],
+            predicted_vector_data=wind_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Wind (m/s)",
+            save_path="val_wind_prediction.mp4",
+            year=year,
+            fps=fps
         )
 
-        # (iv) Incertitude Vent : idem => [incert_pred, incert_real]
-        wind_incert_stacked = torch.stack(
-            [wind_incert_pred_cat, wind_incert_real_cat], dim=0
-        )  # => (2, N, lat, lon)
-
-        compute_animation_for_scalars(
-            scalars=wind_incert_stacked.numpy(),
-            save_path='val_wind_incert_animation.mp4',
-            titles=['wind_incert_pred (NLL)', 'wind_incert_real (L1)'],
-            cbar_label='Uncertainty (Wind)',
-            fps=fps,
-            log_wandb=log_wandb
+        compute_animation_for_vector_difference(
+            true_vector_data=wind_real[:N],
+            predicted_vector_data=wind_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Wind (m/s)",
+            save_path="val_wind_difference.mp4",
+            year=year,
+            fps=fps
         )
 
+        
+        
+        temp_incert_pred = torch.cat(all_incert_temp_pred, dim=0).cpu().numpy()
+        temp_incert_real = torch.cat(all_incert_temp_real, dim=0).cpu().numpy()
+        
+        temp_incert_pred = (temp_incert_pred - np.mean(temp_incert_pred)) / np.std(temp_incert_pred)
+        temp_incert_real = (temp_incert_real - np.mean(temp_incert_real)) / np.std(temp_incert_real)
+        compute_animation_for_scalar(
+            true_data=temp_incert_real[:N],
+            predicted_data=temp_incert_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Temperature Uncertainty",
+            save_path="val_temperature_uncertainty.mp4",
+            year=year,
+            fps=fps
+        )
+
+        
+        wind_incert_pred = torch.cat(all_incert_wind_pred, dim=0).cpu().numpy()
+        wind_incert_real = torch.cat(all_incert_wind_real, dim=0).cpu().numpy()
+        wind_incert_pred = (wind_incert_pred - np.mean(wind_incert_pred)) / np.std(wind_incert_pred)
+        wind_incert_real = (wind_incert_real - np.mean(wind_incert_real)) / np.std(wind_incert_real)
+        compute_animation_for_scalar(
+            true_data=wind_incert_real[:N],
+            predicted_data=wind_incert_pred[:N],
+            lat=lat_vals,
+            lon=lon_vals,
+            title="Wind Uncertainty",
+            save_path="val_wind_uncertainty.mp4",
+            year=year,
+            fps=fps
+        )
+        
+        wandb.log({
+            "Val/Temperature Prediction": wandb.Video("val_temperature_prediction.mp4", fps=fps),
+            "Val/Temperature Difference": wandb.Video("val_temperature_difference.mp4", fps=fps),
+            "Val/Wind Prediction": wandb.Video("val_wind_prediction.mp4", fps=fps),
+            "Val/Wind Difference": wandb.Video("val_wind_difference.mp4", fps=fps),
+            "Val/Temperature Uncertainty": wandb.Video("val_temperature_uncertainty.mp4", fps=fps),
+            "Val/Wind Uncertainty": wandb.Video("val_wind_uncertainty.mp4", fps=fps),
+        })
     gen.train()
     return avg_mse, (example_x, example_y, example_fake)
+
 
 
 def train_wgangp_conditional(
@@ -292,7 +370,7 @@ def train_wgangp_conditional(
             coords = torch.concat([lat, lon], 1)
             x = torch.cat([inputs, mask, coords], dim=1) 
             y = batch_data["target"].to(device)
-
+            
             x = x.permute(0, 3, 2, 1)  
             y = y.permute(0, 3, 2, 1) 
 
@@ -357,6 +435,8 @@ def train_wgangp_conditional(
             logs["Dist/Var_diff"]  = var_diff.item()
 
             wandb.log(logs, step=global_step)
+            
+
 
         nb_batches = len(loader)
         avg_disc_loss = epoch_disc_loss / nb_batches
@@ -384,13 +464,16 @@ def train_wgangp_conditional(
         wandb.log(epoch_logs, step=global_step)
 
         if val_loader is not None:
+            video = (epoch+1)%5 == 0
             val_mse, (val_x, val_y, val_fake) = validate(
                 gen, 
                 val_loader, 
                 device,
                 log_wandb=True, 
-                generate_video=False
+                generate_video=video,
+                fps=48
             )
+            global_step += 1
             wandb.log({"Val/MSE": val_mse}, step=global_step)
 
             real_2d = val_y[0, :, :, 0].numpy()
@@ -401,39 +484,9 @@ def train_wgangp_conditional(
             axs[1].imshow(fake_2d.T, aspect='auto', origin='lower')
             axs[1].set_title("Val: Fake (ch=0)")
             plt.tight_layout()
+            print("Logging Val/Real_vs_Fake")
             wandb.log({"Val/Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
             plt.close(fig)
-
-            if (epoch + 1) % 5 == 0:
-                print(f"Generating validation video at epoch {epoch+1} ...")
-                validate(
-                    gen, 
-                    val_loader, 
-                    device,
-                    log_wandb=True, 
-                    generate_video=True,
-                    fps=48
-                )
-
-        if (epoch+1) % visual_interval == 0:
-            gen.eval()
-            with torch.no_grad():
-                sample_x = x[:1]
-                sample_y = y[:1]
-                sample_fake = gen.sample(sample_x)
-
-                real_2d = sample_y[0, :, :, 0].cpu().numpy()
-                fake_2d = sample_fake[0, :, :, 0].cpu().numpy()
-
-                fig, axs = plt.subplots(1, 2, figsize=(10,4))
-                axs[0].imshow(real_2d.T, aspect='auto', origin='lower')
-                axs[0].set_title("Train Real (ch=0)")
-                axs[1].imshow(fake_2d.T, aspect='auto', origin='lower')
-                axs[1].set_title("Train Fake (ch=0)")
-                plt.tight_layout()
-                wandb.log({"Train/Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
-                plt.close(fig)
-            gen.train()
 
         checkpoint = {
             'epoch': epoch + 1,
@@ -518,6 +571,8 @@ def main():
     )
     train_loader = DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True, num_workers=8)
     val_loader = DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False, num_workers=5)
+
+    
 
     gen = ConditionalFlowGenerator2d(
         context_channels=7,
