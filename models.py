@@ -209,6 +209,45 @@ class ConditionalFlowGenerator2d(nn.Module):
         for flow in self.flows:
             z, _ = flow(z, x)
         return z
+    
+    def sample_most_probable(self, x, num_samples=100):
+        """
+        Generate multiple samples and return the most probable value for each pixel position.
+        
+        Args:
+            x: Input context tensor of shape (B, P, A, C_in)
+            num_samples: Number of samples to generate
+            
+        Returns:
+            Tensor with the most probable value for each pixel position
+        """
+        # Generate multiple samples and compute their log probabilities
+        all_samples = []
+        all_log_probs = []
+        
+        for _ in range(num_samples):
+            sample = self.sample(x)
+            log_prob = self.log_prob(sample, x)
+            
+            all_samples.append(sample)
+            all_log_probs.append(log_prob)
+        
+        # Stack tensors along a new dimension
+        all_samples = torch.stack(all_samples)
+        all_log_probs = torch.stack(all_log_probs)
+        
+        # Find indices of max log probabilities along the sample dimension
+        max_indices = torch.argmax(all_log_probs, dim=0)
+        
+        # Create output tensor
+        best_sample = torch.zeros_like(all_samples[0], device=x.device)
+        
+        # Extract the most probable value for each position
+        for i in range(num_samples):
+            mask = (max_indices == i)
+            best_sample[mask] = all_samples[i][mask]
+        
+        return best_sample
 
     def log_prob(self, y, x):
         """

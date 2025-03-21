@@ -114,7 +114,7 @@ def validate(gen, val_loader, device, norm_params=None, log_wandb=True, generate
             y = y.permute(0, 3, 2, 1)
 
             
-            fake = gen.sample_mode(x)
+            fake = gen.sample_most_probable(x,num_samples=3)
             all_fakes.append(fake.cpu())
             all_reals.append(y.cpu())
 
