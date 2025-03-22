@@ -1,5 +1,14 @@
 # Climate Simulation Project with Conditional Flow Generator
 
+This repository contains a project focused on climate simulation using a conditional flow generator. The main goal is to generate realistic climate data, specifically temperature and wind components, based on historical data from the ERA5 dataset and predict : 
+
+- **Wind & Temperature**: 
+  - The model predicts wind components (u and v) and temperature (t2m) based on historical data.
+![wind_prediction](visu/wind_prediction.gif)
+- **Uncertainty Quantification**: 
+  - The model also provides uncertainty quantification for the generated data.
+![uncertainty_quantification](visu/uncertainty_quantification.gif)
+
 This project implements a conditional generator based on a WGAN-GP architecture for climate simulation. It includes:
 
 - A training script using a combination of conditional flows, NLL loss, and optionally reconstruction loss.
