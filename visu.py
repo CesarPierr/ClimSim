@@ -444,6 +444,7 @@ def main():
         data_dir=args.data_dir,
         save_dir=args.save_dir
     )
+#python3 visu.py --checkpoint FlowGAN/model_1_16_low_reco.pth --year 2000 --fps 24 --duration 10 --save_dir visualizations
 
 if __name__ == "__main__":
     main()

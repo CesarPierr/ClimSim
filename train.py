@@ -481,7 +481,7 @@ def train_wgangp_conditional(
                 print("Logging Val/Real_vs_Fake")
                 epoch_logs[f"Val/Real_vs_Fake_{label}"] = fig_to_wandb_image(fig)
                 plt.close(fig)
-        wandb.log(epoch_logs, step=global_step)
+        wandb.log(epoch_logs)
         checkpoint = {
             'epoch': epoch + 1,
             'global_step': global_step,
