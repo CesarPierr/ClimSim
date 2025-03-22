@@ -16,8 +16,6 @@ This project implements a conditional generator based on a WGAN-GP architecture 
 - [Training Process](#training-process)
 - [Testing a Model and Creating Visualizations](#testing-a-model-and-creating-visualizations)
 - [Using Hugging Face](#using-hugging-face)
-- [Contributing](#contributing)
-- [License](#license)
 
 ---
 
