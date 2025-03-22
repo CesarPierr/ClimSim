@@ -225,6 +225,7 @@ def compute_animation_for_vector_difference(true_vector_data, predicted_vector_d
     cbar.set_label('Wind Speed Difference (m/s)')
 
     def update_vector(frame):
+        
         u_true = true_vector_data[frame, 0]
         v_true = true_vector_data[frame, 1]
         u_pred = predicted_vector_data[frame, 0]
