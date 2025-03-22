@@ -139,6 +139,9 @@ The project includes an interactive notebook ([`notebook_model_visualization.ipy
    - Use `hf_hub_download` to fetch the checkpoint.
    - Load the model and prepare predictions for visualizations.
 
+  
+  The Huggingface repository is available at: [huggingface.co/pcesar/FlowGAN](https://huggingface.co/pcesar/FlowGAN).
+
 ---
 
 
