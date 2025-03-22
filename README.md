@@ -1,75 +1,156 @@
-# Conditional WGAN-GP with Normalizing Flows
+# Climate Simulation Project with Conditional Flow Generator
 
-## Introduction
+This project implements a conditional generator based on a WGAN-GP architecture for climate simulation. It includes:
 
-This project implements a **Conditional Generative Adversarial Network** integrated with **Normalizing Flows**. 
-## Features
+- A training script using a combination of conditional flows, NLL loss, and optionally reconstruction loss.
+- A visualization module to generate animations comparing predictions and ground truth.
+- Tools to test and deploy the model via Hugging Face (interactive notebook, API, etc.).
 
-- **Conditional WGAN-GP**: Enhances the standard WGAN-GP by incorporating conditional information, allowing the generator to produce outputs based on specific input conditions.
-- **Normalizing Flows**: Utilizes normalizing flows to model complex data distributions with exact likelihood computation.
-- **TensorBoard Integration**: Logs training metrics and visualizations for real-time monitoring.
-- **Checkpointing**: Saves model states after each epoch, enabling training resumption from saved checkpoints.
-`
+---
 
-## Model Architecture
+## Table of Contents
 
-### Generator (ConditionalFlowGenerator)
+- [Installation and Dependencies](#installation-and-dependencies)
+- [Project Structure](#project-structure)
+- [Running Training](#running-training)
+- [Training Process](#training-process)
+- [Testing a Model and Creating Visualizations](#testing-a-model-and-creating-visualizations)
+- [Using Hugging Face](#using-hugging-face)
+- [Contributing](#contributing)
+- [License](#license)
 
-Combines a **Prior Network (PNet)** and multiple **Conditional Affine Flow Layers** to model the conditional distribution \( p(y|x) \):
+---
 
-- **PNet**: Processes input conditions \( x \) to produce mean and standard deviation for latent variables.
-- **Flows**: Apply a series of affine transformations conditioned on \( x \), enabling complex distribution modeling.
+## Installation and Dependencies
 
-### Discriminator (ConditionalWGANGPDiscriminator)
+Ensure you have Python 3.8 or higher installed. Install the required dependencies via pip:
 
-A **Conditional Discriminator** that evaluates the authenticity of generated samples \( y \) given the input conditions \( x \):
+```bash
+pip install -r requirements.txt
+```
 
-- **Input**: Concatenated \( x \) and \( y \) along the channel dimension.
-- **Architecture**: Several convolutional layers followed by a linear layer to output a real-valued score.
+If you plan to use [huggingface_hub](https://huggingface.co/docs/huggingface_hub) for model uploading or downloading, install it with:
 
-## Training Procedure
+```bash
+pip install huggingface_hub
+```
 
-1. **Initialization**: Instantiate the generator and discriminator models, and define their optimizers.
-2. **Epoch Loop**: For each epoch:
-   - **Discriminator Update**:
-     - Generate fake samples using the generator.
-     - Compute WGAN loss: \( \text{loss}_D = -\mathbb{E}[D(x, y_{\text{real}})] + \mathbb{E}[D(x, y_{\text{fake}})] \).
-     - Apply Gradient Penalty to enforce Lipschitz constraint.
-     - Backpropagate and update discriminator weights.
-   - **Generator Update**:
-     - Generate fake samples.
-     - Compute adversarial loss: \( \text{loss}_{G_{\text{adv}}} = -\mathbb{E}[D(x, y_{\text{fake}})] \).
-     - Compute Negative Log-Likelihood (NLL) loss.
-     - Combine losses and backpropagate to update generator weights.
-3. **Logging**: Record training metrics and generated samples to TensorBoard.
-4. **Checkpointing**: Save model states after each epoch for future resumption.
+---
 
-## Logging and Checkpoints
+## Project Structure
 
-### TensorBoard Logging
+- **`train.py`**  
+  Training script handling data loading, model creation (conditional generator and WGAN-GP discriminator), training process, checkpointing, and logging via wandb.
 
-The training script logs the following metrics to TensorBoard:
+- **`visu.py`**  
+  Visualization module for generating animations and static visualizations (temperature, wind, differences, etc.).
 
-- **Discriminator Loss**: Measures the discriminator's ability to distinguish real from fake samples.
-- **Gradient Penalty**: Ensures the discriminator adheres to the Lipschitz constraint.
-- **Generator Adversarial Loss**: Reflects the generator's performance in fooling the discriminator.
-- **Generator NLL Loss**: Represents the likelihood of real data under the generator's distribution.
-- **Generated Samples**: Visual comparisons between real and fake samples for qualitative assessment.
+- **`dataset.py`**  
+  Contains `load_dataset` and `ERADataset` classes to load and preprocess the ERA5 dataset (or similar).
 
-### Checkpointing
+- **`models.py`**  
+  Defines model architectures:  
+  - `ConditionalFlowGenerator2d`  
+  - `ConditionalWGANGPDiscriminator2d`  
+  - `gradient_penalty_conditional`
 
-Model checkpoints are saved at the end of each epoch in the specified `save_dir`. Each checkpoint includes:
+- **`notebook_model_visualization.ipynb`**  
+  Interactive notebook demonstrating how to download a checkpoint from Hugging Face Hub, load the model, generate predictions, and visualize results.
 
-- **Generator State**: Saved as `gen_epoch_{epoch}.pth`.
-- **Discriminator State**: Saved as `disc_epoch_{epoch}.pth`.
+---
 
-These checkpoints can be used to resume training or for later inference.
+## Running Training
 
-## Visualization
+To start training, run the `train.py` script from the command line. For example:
 
-After each epoch (or at specified intervals), the training script generates and logs visual comparisons between real and fake samples:
+```bash
+python train.py --num_epochs 100 --batch_size 4 --lr 1e-4 --lr_discr 1e-4 --save_dir checkpoints --wandb_project ClimSim
+```
 
-- **Real Sample**: An example from the dataset.
-- **Fake Sample**: Corresponding output from the generator.
+### Main Arguments:
 
-These visualizations help in qualitatively assessing the generator's performance and ensuring that the generated data aligns well with real data patterns.
+- `--save_dir`: Directory to save checkpoints.
+- `--num_epochs`: Total number of training epochs.
+- `--lr` and `--lr_discr`: Learning rates for generator and discriminator.
+- `--batch_size`: Batch size.
+- `--lambda_gp`: Gradient penalty coefficient.
+- `--alpha_nll`: Weight of the NLL loss.
+- `--use_recon` and `--alpha_recon`: Optionally activate and weight the reconstruction loss.
+- `--nb_flows`: Number of flows in the generator.
+- `--normalize`: Indicates whether to normalize data.
+- `--wandb_project`: Project name for wandb logging.
+
+The script automatically searches for a checkpoint in the specified directory and resumes training if one is found.
+
+---
+
+## Training Process
+
+1. **Data Loading:**
+   The `load_dataset` function splits the data files into training and validation sets. Data includes variables such as temperature and wind components, along with masks and geographical coordinates.
+
+2. **Model Creation:**
+   - The **generator** (`ConditionalFlowGenerator2d`) takes as input a tensor composed of inputs, masks, and coordinates.  
+   - The **discriminator** (`ConditionalWGANGPDiscriminator2d`) receives both predictions and ground truth.
+
+3. **Training:**
+   - The generator produces samples via `sample` or `sample_most_probable`.
+   - Discriminator loss is calculated with gradient penalty via `gradient_penalty_conditional`.
+   - Generator training combines adversarial loss, NLL loss, and optionally reconstruction loss.
+   - Logs (errors, mean and variance differences) are sent to wandb.
+   - Checkpoints are saved at the end of each epoch.
+
+---
+
+## Testing a Model and Creating Visualizations
+
+To test a model and generate visualizations (videos or images), use the visualization script (e.g., `visualize_final.py`):
+
+```bash
+python visualize_final.py --checkpoint checkpoints/checkpoint_epoch_10.pth --data_dir /path/to/era5_data --year 2000 --fps 24 --duration 10 --save_dir visualizations
+```
+
+### Visualization Features:
+
+- **Loading the Model:**
+  The `load_checkpoint_cf` function loads the conditional generator checkpoint and retrieves the number of flows used.
+
+- **Data Preparation:**
+  The validation dataset batch is prepared by concatenating inputs, masks, and coordinates. Dimensions are rearranged to match the model's expected input format.
+
+- **Prediction Generation:**
+  The `sample_most_probable` method is used with `num_samples=100` to generate robust predictions.
+
+- **Video Generation:**
+  The `compute_animation_for_scalar` function generates a temperature video after denormalization and conversion from Kelvin to Celsius.
+
+---
+
+## Using Hugging Face
+
+The project includes an interactive notebook ([`notebook_model_visualization.ipynb`](./notebook_model_visualization.ipynb)) demonstrating how to:
+
+1. **Upload a Checkpoint to Hugging Face Hub:**
+   - Log in with `huggingface-cli login`.
+   - Create a repository on [Hugging Face](https://huggingface.co/new).
+   - Upload the checkpoint using `git lfs`.
+
+2. **Download and Test the Model:**
+   - Use `hf_hub_download` to fetch the checkpoint.
+   - Load the model and prepare predictions for visualizations.
+
+---
+
+## Contributing
+
+Contributions are welcome! If you wish to enhance the project or add new features, please create a [pull request](https://help.github.com/articles/about-pull-requests/) following the contribution guidelines.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+
+*For any questions or issues, feel free to contact the project maintainers or open an issue on GitHub.*
+
