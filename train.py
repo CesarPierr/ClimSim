@@ -553,6 +553,7 @@ def main():
         wandb.init(
             project=args.wandb_project,
             config=vars(args),
+            resume_from=f"{wandb_run_id}?_step=109600"
         )
 
     dataset_dir = "/home/ensta/ensta-cesar/era_5_data/"
