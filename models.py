@@ -229,8 +229,8 @@ class ConditionalFlowGenerator2d(nn.Module):
             sample = self.sample(x)
             log_prob = self.log_prob(sample, x)
             
-            all_samples.append(sample)
-            all_log_probs.append(log_prob)
+            all_samples.append(sample.detach().cpu())
+            all_log_probs.append(log_prob.detach().cpu())
         
         # Stack tensors along a new dimension
         all_samples = torch.stack(all_samples)
@@ -240,14 +240,14 @@ class ConditionalFlowGenerator2d(nn.Module):
         max_indices = torch.argmax(all_log_probs, dim=0)
         
         # Create output tensor
-        best_sample = torch.zeros_like(all_samples[0], device=x.device)
+        best_sample = torch.zeros_like(all_samples[0])
         
         # Extract the most probable value for each position
         for i in range(num_samples):
             mask = (max_indices == i)
             best_sample[mask] = all_samples[i][mask]
         
-        return best_sample
+        return best_sample.to(x.device)
 
     def log_prob(self, y, x):
         """
