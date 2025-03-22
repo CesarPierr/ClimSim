@@ -44,6 +44,8 @@ def parse_arguments():
     parser.add_argument("--visual_interval", type=int, default=1, help="Epoch interval to log images with wandb.")
     parser.add_argument("--use_recon", action="store_true", help="Use MSE reconstruction loss or not.")
     parser.add_argument("--alpha_recon", type=float, default=1.0, help="Weight of the reconstruction loss if use_recon is True.")
+    parser.add_argument("--nb_flows", type=int, default=4, help="Number of flows in the generator.")
+    parser.add_argument("--normalize", action="store_true", help="Normalize the data.")
     parser.add_argument("--wandb_project", type=str, default="ClimSim", help="Wandb project name.")
 
     return parser.parse_args()
@@ -455,10 +457,10 @@ def train_wgangp_conditional(
         if use_recon:
             epoch_logs["Epoch/G_recon"] = avg_gen_recon
 
-        wandb.log(epoch_logs, step=global_step)
+
 
         if val_loader is not None:
-            video = (epoch+1)%5 == 0
+            video = (epoch+1)%10 == 0
             val_mse, (val_x, val_y, val_fake) = validate(
                 gen, 
                 val_loader, 
@@ -467,21 +469,19 @@ def train_wgangp_conditional(
                 generate_video=video,
                 fps=48
             )
-            global_step += 1
-            wandb.log({"Val/MSE": val_mse}, step=global_step)
-
-            real_2d = val_y[0, :, :, 0].numpy()
-            fake_2d = val_fake[0, :, :, 0].numpy()
-            fig, axs = plt.subplots(1, 2, figsize=(10,4))
-            axs[0].imshow(real_2d.T, aspect='auto', origin='lower')
-            axs[0].set_title("Val: Real (ch=0)")
-            axs[1].imshow(fake_2d.T, aspect='auto', origin='lower')
-            axs[1].set_title("Val: Fake (ch=0)")
-            plt.tight_layout()
-            print("Logging Val/Real_vs_Fake")
-            wandb.log({"Val/Real_vs_Fake": fig_to_wandb_image(fig)}, step=global_step)
-            plt.close(fig)
-
+            for i,label in enumerate(['2m_temperature', '10m_u_component_of_wind', '10m_v_component_of_wind']):
+                real_2d = val_y[0, :, :, i].numpy()
+                fake_2d = val_fake[0, :, :, i].numpy()
+                fig, axs = plt.subplots(1, 2, figsize=(10,4))
+                axs[0].imshow(real_2d.T, aspect='auto', origin='lower')
+                axs[0].set_title("Val: Real (ch=0)")
+                axs[1].imshow(fake_2d.T, aspect='auto', origin='lower')
+                axs[1].set_title("Val: Fake (ch=0)")
+                plt.tight_layout()
+                print("Logging Val/Real_vs_Fake")
+                epoch_logs[f"Val/Real_vs_Fake_{label}"] = fig_to_wandb_image(fig)
+                plt.close(fig)
+        wandb.log(epoch_logs, step=global_step)
         checkpoint = {
             'epoch': epoch + 1,
             'global_step': global_step,
@@ -561,7 +561,7 @@ def main():
         train_val_split=0.8,
         year0=1979,
         root_dir=dataset_dir,
-        normalize=True
+        normalize=args.normalize
     )
     train_loader = DataLoader(datasets["train"], batch_size=args.batch_size, shuffle=True, num_workers=8)
     val_loader = DataLoader(datasets["val"], batch_size=args.batch_size, shuffle=False, num_workers=5)
@@ -571,7 +571,7 @@ def main():
     gen = ConditionalFlowGenerator2d(
         context_channels=7,
         latent_channels=3,
-        num_flows=16
+        num_flows=args.nb_flows,
     ).to(device)
     
     disc = ConditionalWGANGPDiscriminator2d(

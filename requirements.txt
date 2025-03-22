@@ -1,0 +1,12 @@
+torch
+torchvision
+matplotlib
+wandb
+tqdm
+numpy
+Pillow
+cartopy
+huggingface_hub
+fastapi
+uvicorn
+torch-uncertainty
