@@ -5,3 +5,8 @@ runs/
 train/
 ClimSim_low-res_grid-info.nc
 __*
+wandb/
+
+*.mp4
+checkpoints*/
+era5*
