@@ -13,6 +13,8 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 from dataset import load_dataset, ERADataset
 from models import ConditionalFlowGenerator2d
+from torch_uncertainty.metrics import AUSE
+from huggingface_hub import hf_hub_download
 # Render settings
 mpl.rcParams['text.antialiased'] = True
 mpl.rcParams['lines.antialiased'] = True
@@ -51,9 +53,9 @@ def get_animation_writer(save_path, fps, total_frames=None):
     if save_path.endswith('.mp4'):
         if animation.writers['ffmpeg'].isAvailable():
             if total_frames is not None:
-                writer = TQDMWriter(total_frames=total_frames, fps=fps, metadata=dict(artist='Me'), bitrate=5000)
+                writer = TQDMWriter(total_frames=total_frames, fps=fps, metadata=dict(artist='Me'), bitrate=2000)
             else:
-                writer = FFMpegWriter(fps=fps, metadata=dict(artist='Me'), bitrate=5000)
+                writer = FFMpegWriter(fps=fps, metadata=dict(artist='Me'), bitrate=2000)
         else:
             print("FFmpeg non disponible. Passage au format GIF.")
             save_path = save_path.replace('.mp4', '.gif')
@@ -66,17 +68,21 @@ def get_animation_writer(save_path, fps, total_frames=None):
 # Model and Prediction Functions
 # =============================================================================
 
-def load_checkpoint_cf(checkpoint_path, device):
+def load_checkpoint_cf(checkpoint, device,num_flows):
     """
     Charge le checkpoint pour le générateur conditionnel.
     On récupère le nombre de flows (par défaut 4 si non précisé dans le checkpoint).
     """
+    repo_id = "pcesar/FlowGAN" 
+
+
+    checkpoint_path = hf_hub_download(repo_id=repo_id, filename=checkpoint)
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    nb_flows = checkpoint.get("nb_flows", 16)
     gen = ConditionalFlowGenerator2d(
         context_channels=7,
         latent_channels=3,
-        num_flows=nb_flows
+        num_flows=num_flows
     ).to(device)
     gen.load_state_dict(checkpoint['gen_state_dict'])
     gen.eval()
@@ -92,36 +98,6 @@ def denormalize_variable(data, var_params):
         var_max = var_params['max']
     return data * (var_max - var_min) + var_min
 
-def generate_predictions(model, dataloader, device, duration=10):
-    """Generate predictions for several timesteps."""
-    model.eval()
-    predictions = []
-    targets = []
-    norm_params = None
-
-    with torch.no_grad():
-        for i, batch in enumerate(dataloader):
-            if i >= duration:
-                break
-            if norm_params is None:
-                norm_params = batch['norm_params']
-            inputs = batch['input'].to(device)
-            batch_targets = batch['target'].to(device)
-            masks = batch['masks'].to(device)
-            coords = [coord.to(device) for coord in batch['coords']]
-
-            outputs = model(inputs, masks, coords, compute_physics=False)['output']
-            predictions.append(outputs.cpu())
-            targets.append(batch_targets.cpu())
-
-            # Explicitly delete tensors and free GPU memory
-            del outputs, inputs, batch_targets, masks, coords
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-    predictions = torch.cat(predictions, dim=0).numpy()
-    targets = torch.cat(targets, dim=0).numpy()
-    return predictions, targets, norm_params
 
 def transform_longitude(arr):
     """Transform longitude by splitting 64 points at index 32 and concatenating."""
@@ -249,6 +225,7 @@ def compute_animation_for_vector_difference(true_vector_data, predicted_vector_d
     cbar.set_label('Wind Speed Difference (m/s)')
 
     def update_vector(frame):
+        
         u_true = true_vector_data[frame, 0]
         v_true = true_vector_data[frame, 1]
         u_pred = predicted_vector_data[frame, 0]
@@ -348,101 +325,262 @@ def compute_animation_for_vector(true_vector_data, predicted_vector_data, lat, l
 # High-Level Visualization Function
 # =============================================================================
 
-def visualize_predictions_cf(checkpoint_path, year, fps, duration, data_dir, save_dir):
+def visualize_predictions_cf(checkpoint, year, fps, duration, data_dir, save_dir,num_flows):
     """
     Charge le modèle à partir d'un checkpoint et génère une vidéo finale.
     La méthode sample_most_probable (ici utilisée comme sample_max_prob) est appelée avec num_samples=100.
     """
     # Charger le dataset de validation
-    datasets = load_dataset(
-        nb_file=10,
-        train_val_split=0.8,
-        year0=1979,
+    dataset = load_dataset(
+        nb_file=1,
+        year0=2000,
         root_dir=data_dir,
         normalize=True
     )
-    val_dataset = datasets["val"]
-    val_loader = DataLoader(val_dataset, batch_size=fps, shuffle=False, num_workers=5)
-
-    # Récupérer un batch de données pour générer la vidéo
-    batch_data = next(iter(val_loader))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    inputs = batch_data["input"].to(device)
-    masks = batch_data["masks"].to(device)
-    lat_coord = batch_data["coords"][0].unsqueeze(1).to(device)
-    lon_coord = batch_data["coords"][1].unsqueeze(1).to(device)
-    coords = torch.cat([lat_coord, lon_coord], dim=1)
-    x = torch.cat([inputs, masks, coords], dim=1)
-    # On remet dans l'ordre attendu par le modèle (B, channels, width, height)
-    x = x.permute(0, 3, 2, 1)
-    
-    # Charger le générateur depuis le checkpoint
-    gen, _ = load_checkpoint_cf(checkpoint_path, device)
-    
-    # Générer la prédiction en utilisant 100 échantillons (méthode sample_max_prob)
-    # Ici, on considère que sample_max_prob est équivalent à sample_most_probable
-    fake = gen.sample_most_probable(x, num_samples=100)
-    
-    # Réorganiser les dimensions pour la visualisation : (num_samples, width, height, channels)
-    fake = fake.permute(0, 3, 2, 1).cpu().detach().numpy()
-    # On transforme les longitudes si besoin (fonction déjà présente)
-    fake = transform_longitude(fake)
-    
-    # Récupérer les paramètres de normalisation du dataset
-    norm_params = val_dataset.get_norm_params()
-    
-    # Traitement pour la température (canal 0)
-    temp_pred = fake[:, :, :, 0]
-    if val_dataset.normalize:
-        temp_pred = denormalize_variable(temp_pred, norm_params['2m_temperature']) - 273.15
-    else:
-        temp_pred = temp_pred - 273.15
+    # Load checkpoint with configuration and get device
+    model, _ = load_checkpoint_cf(checkpoint=checkpoint, device=device,num_flows=num_flows)
+    save_dir += f'/visualizations/{checkpoint}' 
+    os.makedirs(save_dir, exist_ok=True)
 
-    # Définir la grille géographique
+    # Load dataset
+    train_norm_param = load_dataset(
+        year0=year,
+        nb_file=1,
+        root_dir=data_dir,
+        normalize=True
+    )['train'].get_norm_params()
+
+    dataset_val = ERADataset(
+            root_dir=data_dir,
+            years=[year],
+            normalize=True,
+            norm_params=train_norm_param  # Pass training normalization parameters
+        )
+    val_loader = DataLoader(dataset_val, batch_size=fps, shuffle=False)
+    norm_params = None
+    if norm_params is None:
+        norm_params = val_loader.dataset.get_norm_params()
+    model.eval()
+    n_samples = 0
+
+
+    
+    all_fakes = []
+    all_reals = []
+    
+    
+    all_incert_temp_pred = []
+    all_incert_temp_real = []
+    all_incert_wind_pred = []
+    all_incert_wind_real = []
+    
+    
+    ause_metric_temp = AUSE()
+    ause_metric_wind = AUSE()
+
+    
+    with torch.no_grad():
+        second = 0
+        for batch_data in tqdm(val_loader, desc="[Validation]", leave=False):
+            inputs = batch_data["input"].to(device)
+            masks = batch_data["masks"].to(device)
+            lat_coord = batch_data["coords"][0].unsqueeze(1).to(device)
+            lon_coord = batch_data["coords"][1].unsqueeze(1).to(device)
+            
+            _ = batch_data["coords"][2].unsqueeze(1).to(device)
+            coords = torch.cat([lat_coord, lon_coord], dim=1)
+            x = torch.cat([inputs, masks, coords], dim=1)
+            y = batch_data["target"].to(device)
+
+            
+            x = x.permute(0, 3, 2, 1)
+            y = y.permute(0, 3, 2, 1)
+
+            
+            fake = model.sample_mode(x)
+            all_fakes.append(fake.cpu())
+            all_reals.append(y.cpu())
+
+            n_samples += y.numel()
+
+            
+            lp_px = model.log_prob(y, x)
+
+            
+            incert_pred_temp = -lp_px[..., 0]
+            incert_real_temp = (fake[..., 0] - y[..., 0]).abs()
+            all_incert_temp_pred.append(incert_pred_temp.cpu())
+            all_incert_temp_real.append(incert_real_temp.cpu())
+            ause_metric_temp.update(incert_pred_temp.reshape(-1), incert_real_temp.reshape(-1))
+
+            
+            incert_pred_wind = -(lp_px[..., 1:].mean(dim=-1))
+            diff_u = (fake[..., 1] - y[..., 1])
+            diff_v = (fake[..., 2] - y[..., 2])
+            incert_real_wind = torch.sqrt(diff_u**2 + diff_v**2)
+            all_incert_wind_pred.append(incert_pred_wind.cpu())
+            all_incert_wind_real.append(incert_real_wind.cpu())
+            ause_metric_wind.update(incert_pred_wind.reshape(-1), incert_real_wind.reshape(-1))
+            second += 1
+            if second >= duration:
+                break
+            
+    fakes_concat = torch.cat(all_fakes, dim=0)  
+    reals_concat = torch.cat(all_reals, dim=0)
+
+    fakes_concat = fakes_concat.permute(0, 3, 2, 1).cpu().numpy()  
+    reals_concat = reals_concat.permute(0, 3, 2, 1).cpu().numpy()
+
+    fakes_concat= transform_longitude(fakes_concat)
+    reals_concat = transform_longitude(reals_concat)
+    
+    
+    temp_pred = fakes_concat[:, 0]
+    temp_real = reals_concat[:, 0]
+    print("Temperature pred min before:", temp_pred.min(), temp_pred.max())
+    print("Temperature real min before:", temp_real.min(), temp_real.max())
+    
+    if val_loader.dataset.normalize:
+        temp_pred = denormalize_variable(temp_pred, norm_params['2m_temperature']) - 273.15
+        temp_real = denormalize_variable(temp_real, norm_params['2m_temperature']) - 273.15
+
+        
+    else :
+        temp_pred -= 273.15
+        temp_real -= 273.15
+    
+    
+    print("Temperature pred min:", temp_pred.min(), temp_pred.max())
+    print("Temperature real min:", temp_real.min(), temp_real.max())
+    wind_pred = fakes_concat[:, 1:3]
+    wind_real = reals_concat[:, 1:3]
+
+    
+    print("Wind pred min before:", wind_pred.min(), wind_pred.max())
+    print("Wind real min before:", wind_real.min(), wind_real.max())
+    if val_loader.dataset.normalize:
+        
+        wind_real[:, 0] = denormalize_variable(wind_real[:, 0], norm_params['10m_u_component_of_wind'])
+        wind_real[:, 1] = denormalize_variable(wind_real[:, 1], norm_params['10m_v_component_of_wind'])
+        wind_pred[:, 0] = denormalize_variable(wind_pred[:, 0], norm_params['10m_u_component_of_wind'])
+        wind_pred[:, 1] = denormalize_variable(wind_pred[:, 1], norm_params['10m_v_component_of_wind'])
+    
+    
+    print("Wind pred min:", wind_pred.min(), wind_pred.max())
+    print("Wind real min:", wind_real.min(), wind_real.max())
     nlat = temp_pred.shape[1]
     nlon = temp_pred.shape[2]
     lat_vals = np.linspace(-90, 90, nlat)
     lon_vals = np.linspace(-180, 180, nlon)
+
     
-    os.makedirs(save_dir, exist_ok=True)
-    video_path = os.path.join(save_dir, f"final_temperature_video_{year}.mp4")
+    N = temp_pred.shape[0]
+
     
-    # Générer la vidéo (ici, on affiche la température prédite sur chaque frame)
     compute_animation_for_scalar(
-         true_data=temp_pred,         # Pour la vidéo finale, true_data et predicted_data sont identiques
-         predicted_data=temp_pred,
-         lat=lat_vals,
-         lon=lon_vals,
-         title="Final Temperature (°C)",
-         save_path=video_path,
-         year=year,
-         fps=fps
+        true_data=temp_real[:N],
+        predicted_data=temp_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Temperature (°C)",
+        save_path="val_temperature_prediction.mp4",
+        year=year,
+        fps=fps
     )
-    print(f"Vidéo finale sauvegardée ici : {video_path}")
+
+    compute_animation_for_temperature_difference(
+        true_data=temp_real[:N],
+        predicted_data=temp_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Temperature (°C)",
+        save_path="val_temperature_difference.mp4",
+        year=year,
+        fps=fps
+    )
+
+    
+    compute_animation_for_vector(
+        true_vector_data=wind_real[:N],
+        predicted_vector_data=wind_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Wind (m/s)",
+        save_path="val_wind_prediction.mp4",
+        year=year,
+        fps=fps
+    )
+
+    compute_animation_for_vector_difference(
+        true_vector_data=wind_real[:N],
+        predicted_vector_data=wind_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Wind (m/s)",
+        save_path="val_wind_difference.mp4",
+        year=year,
+        fps=fps
+    )
+
+    
+    
+    temp_incert_pred = torch.cat(all_incert_temp_pred, dim=0).cpu().numpy()
+    temp_incert_real = torch.cat(all_incert_temp_real, dim=0).cpu().numpy()
+    
+    temp_incert_pred = (temp_incert_pred - np.mean(temp_incert_pred)) / np.std(temp_incert_pred)
+    temp_incert_real = (temp_incert_real - np.mean(temp_incert_real)) / np.std(temp_incert_real)
+    compute_animation_for_scalar(
+        true_data=temp_incert_real[:N],
+        predicted_data=temp_incert_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Temperature Uncertainty",
+        save_path="val_temperature_uncertainty.mp4",
+        year=year,
+        fps=fps
+    )
+
+    
+    wind_incert_pred = torch.cat(all_incert_wind_pred, dim=0).cpu().numpy()
+    wind_incert_real = torch.cat(all_incert_wind_real, dim=0).cpu().numpy()
+    wind_incert_pred = (wind_incert_pred - np.mean(wind_incert_pred)) / np.std(wind_incert_pred)
+    wind_incert_real = (wind_incert_real - np.mean(wind_incert_real)) / np.std(wind_incert_real)
+    compute_animation_for_scalar(
+        true_data=wind_incert_real[:N],
+        predicted_data=wind_incert_pred[:N],
+        lat=lat_vals,
+        lon=lon_vals,
+        title="Wind Uncertainty",
+        save_path="val_wind_uncertainty.mp4",
+        year=year,
+        fps=fps
+    )
 
 def main():
     parser = argparse.ArgumentParser(
         description="Génération de la vidéo finale pour le ConditionalFlowGenerator via un checkpoint."
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Chemin vers le fichier de checkpoint (.pth)")
-    parser.add_argument("--data_dir", type=str, default="/home/ensta/ensta-cesar/era_5_data/", help="Répertoire contenant les données")
+    parser.add_argument("--checkpoint", type=str,default="model_1_16_low_reco.pth", help="model name HuggingFace")
+    parser.add_argument("--data_dir", type=str, default="../era_5_data/", help="Répertoire contenant les données")
     parser.add_argument("--year", type=int, default=2000, help="Année à visualiser")
     parser.add_argument("--fps", type=int, default=24, help="Frames per second pour la vidéo")
     parser.add_argument("--duration", type=int, default=10, help="Nombre de timesteps (durée) pour la vidéo")
     parser.add_argument("--save_dir", type=str, default="visualizations", help="Répertoire de sauvegarde de la vidéo finale")
+    parser.add_argument("--nb_flows", type=int, default=16, help="Nombre de flows dans le modèle")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Utilisation de l'appareil : {device}")
     
     visualize_predictions_cf(
-        checkpoint_path=args.checkpoint,
+        checkpoint=args.checkpoint,
         year=args.year,
         fps=args.fps,
         duration=args.duration,
         data_dir=args.data_dir,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        num_flows=args.nb_flows
     )
 #python3 visu.py --checkpoint FlowGAN/model_1_16_low_reco.pth --year 2000 --fps 24 --duration 10 --save_dir visualizations
 

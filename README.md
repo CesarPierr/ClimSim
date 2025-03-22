@@ -1,5 +1,14 @@
 # Climate Simulation Project with Conditional Flow Generator
 
+This repository contains a project focused on climate simulation using a conditional flow generator. The main goal is to generate realistic climate data, specifically temperature and wind components, based on historical data from the ERA5 dataset and predict : 
+
+- **Wind & Temperature**: 
+  - The model predicts wind components (u and v) and temperature (t2m) based on historical data.
+![wind_prediction](visu/wind_prediction.gif)
+- **Uncertainty Quantification**: 
+  - The model also provides uncertainty quantification for the generated data.
+![uncertainty_quantification](visu/uncertainty_quantification.gif)
+
 This project implements a conditional generator based on a WGAN-GP architecture for climate simulation. It includes:
 
 - A training script using a combination of conditional flows, NLL loss, and optionally reconstruction loss.
@@ -16,8 +25,6 @@ This project implements a conditional generator based on a WGAN-GP architecture 
 - [Training Process](#training-process)
 - [Testing a Model and Creating Visualizations](#testing-a-model-and-creating-visualizations)
 - [Using Hugging Face](#using-hugging-face)
-- [Contributing](#contributing)
-- [License](#license)
 
 ---
 
@@ -64,7 +71,7 @@ pip install huggingface_hub
 To start training, run the `train.py` script from the command line. For example:
 
 ```bash
-python train.py --num_epochs 100 --batch_size 4 --lr 1e-4 --lr_discr 1e-4 --save_dir checkpoints --wandb_project ClimSim
+python train.py --num_epochs 100 --batch_size 64 --lr 1e-4 --lr_discr 1e-4 --save_dir checkpoints --wandb_project ClimSim
 ```
 
 ### Main Arguments:
@@ -115,11 +122,8 @@ python visualize_final.py --checkpoint checkpoints/checkpoint_epoch_10.pth --dat
 - **Loading the Model:**
   The `load_checkpoint_cf` function loads the conditional generator checkpoint and retrieves the number of flows used.
 
-- **Data Preparation:**
-  The validation dataset batch is prepared by concatenating inputs, masks, and coordinates. Dimensions are rearranged to match the model's expected input format.
-
 - **Prediction Generation:**
-  The `sample_most_probable` method is used with `num_samples=100` to generate robust predictions.
+  The `sample_most_probable` method is used with `num_samples=100` to generate most likely predictions.
 
 - **Video Generation:**
   The `compute_animation_for_scalar` function generates a temperature video after denormalization and conversion from Kelvin to Celsius.
@@ -130,27 +134,14 @@ python visualize_final.py --checkpoint checkpoints/checkpoint_epoch_10.pth --dat
 
 The project includes an interactive notebook ([`notebook_model_visualization.ipynb`](./notebook_model_visualization.ipynb)) demonstrating how to:
 
-1. **Upload a Checkpoint to Hugging Face Hub:**
-   - Log in with `huggingface-cli login`.
-   - Create a repository on [Hugging Face](https://huggingface.co/new).
-   - Upload the checkpoint using `git lfs`.
 
-2. **Download and Test the Model:**
+**Download and Test a model on HF**
    - Use `hf_hub_download` to fetch the checkpoint.
    - Load the model and prepare predictions for visualizations.
 
----
-
-## Contributing
-
-Contributions are welcome! If you wish to enhance the project or add new features, please create a [pull request](https://help.github.com/articles/about-pull-requests/) following the contribution guidelines.
+  
+  The Huggingface repository is available at: [huggingface.co/pcesar/FlowGAN](https://huggingface.co/pcesar/FlowGAN).
 
 ---
 
-## License
-
-This project is licensed under the [MIT License](LICENSE).
-
-
-*For any questions or issues, feel free to contact the project maintainers or open an issue on GitHub.*
 
