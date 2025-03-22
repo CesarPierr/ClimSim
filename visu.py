@@ -397,7 +397,7 @@ def visualize_predictions_cf(checkpoint, year, fps, duration, data_dir, save_dir
             y = y.permute(0, 3, 2, 1)
 
             
-            fake = model.sample_most_probable(x,num_samples=100)
+            fake = model.sample_mode(x)
             all_fakes.append(fake.cpu())
             all_reals.append(y.cpu())
 
